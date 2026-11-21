@@ -119,6 +119,18 @@ Standalone: `streamrec web [--bind ADDR:PORT]`.
 From the page you can see what's live, upcoming and past (state, parts, size, restarts, last data, logs),
 schedule a URL or a saved page with date/time pickers, stop or remove entries, and manage saved pages.
 
+**Links that fill in the form.** `http://<tailscale-ip>:8787/?url=<page>&start=21:00&end=23:30` opens the page with the
+add form filled in. Check it and tap Schedule. Nothing is saved until you tap it.
+Parameters: `url` or `page` (a saved page's name), `start` and `end` (`HH:MM`, `2026-11-29T21:00` or a unix
+timestamp), `duration` (`2h30m`), `name`, `mode`.
+
+A bookmark that sends the tab you're on (Firefox: right-click the bookmarks bar → Add Bookmark, paste this as the URL,
+with your tailscale address):
+
+```
+javascript:void(window.open('http://100.x.y.z:8787/?url='+encodeURIComponent(location.href)))
+```
+
 Keep it private:
 - **Don't port-forward it.** It has no login. It only answers clients on loopback, Tailscale (100.64.0.0/10) and private LAN
   addresses, and refuses public IPs even if something forwards a port to it.

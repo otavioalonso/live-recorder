@@ -1178,6 +1178,7 @@ rx="22" fill="#c2410c"/><circle cx="50" cy="50" r="22" fill="#fff"/></svg>"""
 
 JS = """
 const box=document.getElementById('jobs');
+if(/[?&](url|page)=/.test(location.search))document.getElementById('add').scrollIntoView();
 setInterval(()=>fetch('jobs').then(r=>r.ok&&r.text()).then(t=>{if(t)box.innerHTML=t}).catch(()=>{}),20000);
 document.addEventListener('submit',e=>{const m=e.target.dataset.confirm;if(m&&!confirm(m))e.preventDefault()});
 const s=document.getElementById('start'),en=document.getElementById('end');
@@ -1249,11 +1250,28 @@ def jobs_html(path, rec_dir):
     return "".join(out)
 
 
-def page_html(path, rec_dir, msg=None, err=None):
+def prefill_time(v, base=None):
+    """For ?start=/?end= links: 'HH:MM', ISO date-time, or a unix timestamp. None if unreadable."""
+    try:
+        v = v.strip()
+        t = dt.datetime.fromtimestamp(int(v)).astimezone() if v.isdigit() and len(v) >= 9 else parse_when(v, base=base)
+        return t.replace(second=0, microsecond=0)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def page_html(path, rec_dir, msg=None, err=None, pre=None):
+    """pre: values for the add form, from a link like /?url=…&start=21:00&end=23:00&name=…"""
+    pre = pre or {}
     _, pages, _ = read_schedule(path)
     start = (now() + dt.timedelta(minutes=10)).replace(second=0, microsecond=0)
     start += dt.timedelta(minutes=-start.minute % 5)
-    opts = "".join(f'<option value="{e(n)}">{e(n)}</option>' for n in pages)
+    start = prefill_time(pre["start"]) if pre.get("start") and prefill_time(pre["start"]) else start
+    end = (pre.get("end") and prefill_time(pre["end"], base=start)) or start + dt.timedelta(hours=2)
+    opts = "".join(f'<option value="{e(n)}"{" selected" if n == pre.get("page") else ""}>{e(n)}</option>' for n in pages)
+    mode_opts = "".join(f'<option{" selected" if m == pre.get("mode") else ""}>{m}</option>' for m in ("auto", "grab", "screen"))
+    if pre.get("url") or pre.get("page"):
+        msg = msg or "Check the details and tap Schedule."
     page_list = "".join(
         f'<div class="card row" style="align-items:center"><div><div class="name">{e(n)}</div>'
         f'<div class="url">{e(u)}</div></div><form class="inline" method="post" action="page/remove" '
@@ -1269,16 +1287,15 @@ def page_html(path, rec_dir, msg=None, err=None):
 <h1>streamrec <small>{now():%a %d %b %H:%M}</small></h1>{banner}
 <div id="jobs">{jobs_html(path, rec_dir)}</div>
 <h2>Add a recording</h2>
-<form class="card" method="post" action="add">
+<form class="card" id="add" method="post" action="add">
 {f'<label>Saved page</label><select name="page"><option value="">— use the URL below —</option>{opts}</select>' if pages else ''}
-<label>URL</label><input name="url" type="url" inputmode="url" placeholder="https://…" autocomplete="off">
+<label>URL</label><input name="url" type="url" inputmode="url" placeholder="https://…" autocomplete="off" value="{e(pre.get('url', ''))}">
 <div class="two when"><div><label>Start</label><input id="start" name="start" type="datetime-local" required value="{local_input(start)}"></div>
-<div><label>End</label><input id="end" name="end" type="datetime-local" value="{local_input(start + dt.timedelta(hours=2))}"></div></div>
-<details><summary>More options</summary>
-<label>Name (folder)</label><input name="name" placeholder="automatic" autocomplete="off">
-<div class="two"><div><label>Mode</label><select name="mode"><option value="">default</option>
-<option>auto</option><option>grab</option><option>screen</option></select></div>
-<div><label>Duration (instead of end)</label><input name="duration" placeholder="e.g. 2h30m" autocomplete="off"></div></div>
+<div><label>End</label><input id="end" name="end" type="datetime-local" value="{local_input(end)}"></div></div>
+<details{' open' if any(pre.get(k) for k in ('name', 'mode', 'duration')) else ''}><summary>More options</summary>
+<label>Name (folder)</label><input name="name" placeholder="automatic" autocomplete="off" value="{e(pre.get('name', ''))}">
+<div class="two"><div><label>Mode</label><select name="mode"><option value="">default</option>{mode_opts}</select></div>
+<div><label>Duration (instead of end)</label><input name="duration" placeholder="e.g. 2h30m" autocomplete="off" value="{e(pre.get('duration', ''))}"></div></div>
 </details><div style="margin-top:14px"><button class="go">Schedule</button></div></form>
 <h2>Saved pages</h2>{page_list}
 <form class="card" method="post" action="page/add"><div class="two">
@@ -1342,7 +1359,8 @@ def make_handler(path, rec_dir):
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             p = u.path.rstrip("/") or "/"
             if p == "/":
-                self.send(200, page_html(path, rec_dir, q.get("msg"), q.get("err")))
+                pre = {k: q[k] for k in ("url", "page", "start", "end", "duration", "name", "mode") if q.get(k)}
+                self.send(200, page_html(path, rec_dir, q.get("msg"), q.get("err"), pre))
             elif p == "/jobs":
                 self.send(200, jobs_html(path, rec_dir))
             elif p == "/manifest.webmanifest":
