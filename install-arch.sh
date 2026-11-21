@@ -98,7 +98,8 @@ cat > "$UNIT" <<EOF
 Description=$NAME scheduler (records streams listed in $SCHEDULE)
 
 [Service]
-ExecStart=$BIN schedule $SCHEDULE --dir $REC_DIR
+# --web: phone page on the tailscale address, port 8787 (retries until tailscale is up)
+ExecStart=$BIN schedule $SCHEDULE --dir $REC_DIR --web
 Restart=always
 RestartSec=10
 KillMode=mixed
@@ -136,6 +137,8 @@ $(say "done")
   test a page:     $NAME probe URL --show
   quick test:      $NAME record URL --duration 5m --part 1m
   edit schedule:   \$EDITOR $SCHEDULE      (check: $NAME schedule --check)
+  or:              $NAME add URL --start 21:00 --duration 2h   ($NAME list / remove / page)
+  phone page:      http://$(tailscale ip -4 2>/dev/null | head -1 || echo '<tailscale-ip>'):8787/
   service:         systemctl --user $( ((ENABLE)) && echo status || echo "enable --now") $NAME
   service log:     journalctl --user -u $NAME -f
   recordings:      $REC_DIR/<name>/        (join: $NAME join DIR)
