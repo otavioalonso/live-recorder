@@ -26,6 +26,7 @@ Subcommands
   schedule FILE    run every recording listed in a TOML schedule file (for a systemd service)
   list / add / remove / page   view and edit the schedule file from the command line
   web              phone page for the schedule (Tailscale/LAN only); or `schedule --web`
+  sofa ...         SofaScore: follow teams/competitions, schedule matches, follow kickoff changes
 """
 import argparse
 import datetime as dt
@@ -585,7 +586,7 @@ def cmd_join(a):
 
 
 # ----------------------------------------------------------------------------- scheduler
-SCHED_ONLY = ("inhibit_sleep",)  # schedule keys handled here, not passed to `record`
+SCHED_ONLY = ("inhibit_sleep", "sofascore")  # schedule keys handled here, not passed to `record`
 
 
 def to_dt(v, base=None, what="time"):
@@ -640,10 +641,14 @@ def parse_schedule(data):
         name = safe_name(name)
         if name in jobs:
             raise ValueError(f"duplicate stream name {name!r}")
+        if "sofascore" in j and (not isinstance(j["sofascore"], int) or isinstance(j["sofascore"], bool)):
+            raise ValueError(f"stream {name!r}: sofascore must be a match id number")
         job = {"name": name, "url": url, "page": page, "start": start, "end": end, "opts": j,
-               "index": i - 1}
+               "index": i - 1, "raw": entry}
         check_opts(job)
         jobs[name] = job
+    sofa_settings(data)  # validate the SofaScore parts too
+    parse_follows(data, pages)
     return jobs
 
 
@@ -758,6 +763,7 @@ def cmd_schedule(a):
     if a.web:
         threading.Thread(target=serve_web, args=(a.web, path, Path(a.dir).expanduser()),
                          daemon=True).start()
+    threading.Thread(target=sofa_poller, args=(path,), daemon=True).start()
     grace = dt.timedelta(minutes=2)
     jobs, state, warned = {}, {}, False
     log.info("scheduler started; watching %s, recordings go to %s", path, Path(a.dir).expanduser())
@@ -959,14 +965,20 @@ def read_schedule_text(text):
     return parse_schedule(data), {p["name"]: p["url"] for p in data.get("page", [])}, None
 
 
-def remove_stream(path, name):
+def remove_stream(path, name, skip=True):
+    """skip: remember a removed SofaScore match so auto rules don't add it back."""
+    found = {}
+
     def fn(text):
         jobs, _, _ = read_schedule_text(text)
         if name not in jobs:
             raise ValueError(f"no stream called {name!r}")
+        found["id"] = jobs[name]["opts"].get("sofascore")
         return cut_block(text, "stream", jobs[name]["index"])
 
     edit_schedule(path, fn)
+    if skip and isinstance(found.get("id"), int):
+        mark_skipped(found["id"])
 
 
 def add_page(path, name, url):
@@ -1053,6 +1065,559 @@ def human_size(n):
 def ago(ts):
     s = int(time.time() - ts)
     return f"{s}s ago" if s < 120 else f"{s // 60}m ago" if s < 7200 else f"{s // 3600}h ago"
+
+
+# ----------------------------------------------------------------------------- sofascore
+# Follow teams/competitions on SofaScore, schedule their matches, and keep the times right:
+# start = kickoff - lead, end = kickoff + max_hours until the match is finished, then
+# finish + after. SofaScore has no official API and refuses plain scripted requests, so
+# requests go through headless Chromium. If SofaScore is unreachable, entries keep their
+# last known times - a recording is never dropped because the lookup failed.
+#
+# schedule.toml:
+#   [sofascore]                    # optional, these are the defaults
+#   lead = 10                      # minutes before kickoff
+#   after = 10                     # minutes after the final whistle
+#   max_hours = 4                  # hard cap after kickoff
+#   poll = 45                      # minutes between normal checks (every 3 min near/during a match)
+#   days = 14                      # auto rules: schedule matches up to this far ahead
+#
+#   [[follow]]
+#   team = 5981                    # or: tournament = 325   (ids from `streamrec sofa search`)
+#   name = "Flamengo"
+#   page = "channel 1"             # or url = "..."; where its matches are recorded
+#   auto = true                    # schedule every match automatically
+#   mode = "screen"                # any other key is a record option for its streams
+SOFA_API = "https://api.sofascore.com/api/v1/"
+SOFA_SITE = "https://www.sofascore.com/"
+SOFA_DEFAULTS = {"lead": 10, "after": 10, "max_hours": 4, "poll": 45, "days": 14}
+SOFA_STATE = STATE_DIR / "sofascore.json"
+FOLLOW_KEYS = ("team", "tournament", "name", "page", "url", "auto")
+SOFA_LOCK = threading.Lock()  # one browser at a time per process
+
+
+class SofaError(Exception):
+    pass
+
+
+def sofa_settings(data):
+    s = dict(SOFA_DEFAULTS)
+    for k, v in data.get("sofascore", {}).items():
+        if k not in SOFA_DEFAULTS:
+            raise ValueError(f"[sofascore]: unknown key {k!r} (known: {', '.join(SOFA_DEFAULTS)})")
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0:
+            raise ValueError(f"[sofascore] {k}: needs a number")
+        s[k] = v
+    return s
+
+
+def parse_follows(data, pages):
+    defaults = data.get("defaults", {})
+    out = []
+    for i, f in enumerate(data.get("follow", []), 1):
+        kinds = [k for k in ("team", "tournament") if k in f]
+        if len(kinds) != 1 or not isinstance(f[kinds[0]], int) or isinstance(f[kinds[0]], bool):
+            raise ValueError(f"follow #{i}: needs team = <id> or tournament = <id>")
+        kind = kinds[0]
+        if f.get("page") is not None and f["page"] not in pages:
+            raise ValueError(f"follow #{i}: unknown page {f['page']!r}")
+        if f.get("auto") and not (f.get("page") or f.get("url")):
+            raise ValueError(f"follow #{i}: auto = true needs a page or url to record from")
+        opts = {k: v for k, v in f.items() if k not in FOLLOW_KEYS}
+        t = now()
+        check_opts({"name": f"follow #{i}", "url": "https://x", "start": t, "end": t + dt.timedelta(hours=1),
+                    "opts": {**defaults, **opts}})
+        out.append({"key": f"{kind}:{f[kind]}", "kind": kind, "id": f[kind], "name": f.get("name") or f"{kind} {f[kind]}",
+                    "page": f.get("page"), "url": f.get("url"), "auto": bool(f.get("auto")), "opts": opts,
+                    "index": i - 1})
+    keys = [f["key"] for f in out]
+    if len(set(keys)) != len(keys):
+        raise ValueError("the same team/tournament is followed twice")
+    return out
+
+
+def match_id(s):
+    """Event id from a SofaScore match link (…#id:12345678) or a bare number."""
+    s = str(s).strip()
+    m = re.fullmatch(r"\d+", s) or re.search(r"#(?:id:)?(\d+)", s) or re.search(r"[?&]id=(\d+)", s)
+    if not m:
+        raise ValueError("not a SofaScore match link (it should end in #id:<number>)")
+    return int(m[1] if m.lastindex else m[0])
+
+
+class Sofa:
+    """Headless Chromium used as an HTTP client for SofaScore's JSON endpoints."""
+
+    def __enter__(self):
+        SOFA_LOCK.acquire()
+        try:
+            try:
+                from playwright.sync_api import sync_playwright
+            except ImportError:
+                raise SofaError("playwright isn't installed for this Python (use the streamrec venv)") from None
+
+            self._pw = sync_playwright().start()
+            self.browser = self._pw.chromium.launch(
+                headless=True, args=["--disable-blink-features=AutomationControlled"])
+            ua = self.browser.new_page().evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
+            self.ctx = self.browser.new_context(user_agent=ua, locale="en-US")
+            self.page = self.ctx.new_page()
+            self.inside = False  # True once we fetch from inside a loaded sofascore.com page
+            return self
+        except Exception:
+            self._close()
+            raise
+
+    def __exit__(self, *exc):
+        self._close()
+
+    def _close(self):
+        for fn in ("browser", "_pw"):
+            try:
+                o = getattr(self, fn, None)
+                o and (o.close() if fn == "browser" else o.stop())
+            except Exception:
+                pass
+        SOFA_LOCK.release()
+
+    def _fetch_inside(self, url):
+        return self.page.evaluate("""async (u) => { const r = await fetch(u, {headers: {accept: 'application/json'}});
+            return [r.status, await r.text()] }""", url)
+
+    def get(self, path):
+        url = SOFA_API + path
+        try:
+            if self.inside:
+                status, body = self._fetch_inside(url)
+            else:
+                r = self.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                status, body = (r.status, r.text()) if r else (0, "")
+                if status == 403:  # load the site first (cookies/challenge), then ask from inside it
+                    self.page.goto(SOFA_SITE, wait_until="domcontentloaded", timeout=45_000)
+                    self.page.wait_for_timeout(2500)
+                    self.inside = True
+                    status, body = self._fetch_inside(url)
+        except Exception as e:
+            raise SofaError(f"{path}: {e}") from None
+        if status == 404:
+            return None
+        if status != 200:
+            raise SofaError(f"HTTP {status} for {path}" + (" (SofaScore is blocking this connection)"
+                                                           if status == 403 else ""))
+        try:
+            return json.loads(body)
+        except ValueError:
+            raise SofaError(f"{path}: not JSON") from None
+
+    # -- endpoints (unofficial; shapes as used by the website)
+    def search(self, q):
+        data = self.get(f"search/all?q={quote(q)}&page=0") or {}
+        out = []
+        for r in data.get("results", []):
+            e, typ = r.get("entity") or {}, r.get("type")
+            if typ == "team":
+                out.append({"kind": "team", "id": e.get("id"), "name": e.get("name"),
+                            "sport": (e.get("sport") or {}).get("name", ""),
+                            "where": (e.get("country") or {}).get("name", ""),
+                            "gender": e.get("gender", ""), "national": e.get("national", False)})
+            elif typ == "uniqueTournament":
+                cat = e.get("category") or {}
+                out.append({"kind": "tournament", "id": e.get("id"), "name": e.get("name"),
+                            "sport": (cat.get("sport") or {}).get("name", ""), "where": cat.get("name", "")})
+        return [o for o in out if isinstance(o["id"], int)]
+
+    def next_events(self, kind, id_):
+        if kind == "team":
+            data = self.get(f"team/{id_}/events/next/0")
+        else:
+            seasons = (self.get(f"unique-tournament/{id_}/seasons") or {}).get("seasons") or []
+            if not seasons:
+                return []
+            data = self.get(f"unique-tournament/{id_}/season/{seasons[0]['id']}/events/next/0")
+        return [summarize(e) for e in (data or {}).get("events", [])]
+
+    def event(self, id_):
+        data = self.get(f"event/{id_}")
+        if not data or "event" not in data:
+            raise SofaError(f"match {id_} not found")
+        return summarize(data["event"])
+
+
+def summarize(e):
+    """The few fields we use from a SofaScore event."""
+    st = e.get("status") or {}
+    sc = lambda side: (e.get(side) or {}).get("current")
+    tour = e.get("tournament") or {}
+    return {"id": e.get("id"), "kickoff": e.get("startTimestamp"), "status": st.get("type", "unknown"),
+            "desc": st.get("description", ""), "home": (e.get("homeTeam") or {}).get("name", "?"),
+            "away": (e.get("awayTeam") or {}).get("name", "?"), "score": [sc("homeScore"), sc("awayScore")],
+            "tournament": tour.get("name", ""),
+            "sport": ((tour.get("category") or {}).get("sport") or {}).get("name", "")}
+
+
+def kickoff(ev):
+    return dt.datetime.fromtimestamp(ev["kickoff"]).astimezone().replace(second=0, microsecond=0)
+
+
+def ev_title(ev):
+    s = f"{ev['home']} – {ev['away']}"
+    if ev["status"] in ("inprogress", "finished") and None not in ev["score"]:
+        s = f"{ev['home']} {ev['score'][0]}–{ev['score'][1]} {ev['away']}"
+    return s
+
+
+# -- local state: what we've seen, what you removed, what's waiting for a new date
+@contextmanager
+def sofa_state():
+    SOFA_STATE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SOFA_STATE.with_suffix(".lock"), "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            st = json.loads(SOFA_STATE.read_text())
+        except (OSError, ValueError):
+            st = {}
+        for k in ("events", "upcoming", "skipped", "watch"):
+            st.setdefault(k, {})
+        yield st
+        cutoff = time.time() - 90 * 86400  # forget old things
+        st["skipped"] = {k: v for k, v in st["skipped"].items() if v > cutoff}
+        st["watch"] = {k: v for k, v in st["watch"].items() if v.get("since", 0) > cutoff}
+        st["events"] = {k: v for k, v in st["events"].items() if (v.get("kickoff") or 0) > cutoff}
+        tmp = SOFA_STATE.with_name(f".sofascore.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(st))
+        os.replace(tmp, SOFA_STATE)
+
+
+def read_sofa_state():
+    try:
+        return json.loads(SOFA_STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def mark_skipped(event_id):
+    with sofa_state() as st:
+        st["skipped"][str(event_id)] = time.time()
+
+
+# -- schedule changes
+def raw_schedule(path):
+    import tomllib
+
+    text = Path(path).expanduser().read_text() if Path(path).expanduser().exists() else ""
+    return tomllib.loads(text) if text.strip() else {}
+
+
+def set_stream_fields(path, name, fields, drop=()):
+    """Change some keys of one [[stream]] in place (other lines and comments stay)."""
+    def fn(text):
+        jobs = read_schedule_text(text)[0]
+        if name not in jobs:
+            raise ValueError(f"no stream called {name!r}")
+        lines, bl = blocks(text, "stream")
+        i, end = bl[jobs[name]["index"]]
+        body = lines[i + 1:end]
+        if body and not body[-1].endswith("\n"):
+            body[-1] += "\n"
+        for k in list(drop) + list(fields):
+            body = [ln for ln in body if not re.match(rf"\s*{re.escape(k)}\s*=", ln)]
+        body += [f"{k} = {toml_val(v)}\n" for k, v in fields.items()]
+        return "".join(lines[:i + 1] + body + lines[end:])
+
+    edit_schedule(path, fn)
+
+
+def scheduled_ids(jobs):
+    return {j["opts"]["sofascore"]: j for j in jobs.values() if isinstance(j["opts"].get("sofascore"), int)}
+
+
+def add_match(path, ev, page=None, url=None, opts=None, settings=None):
+    """Schedule one match. Returns the stream name."""
+    settings = settings or sofa_settings(raw_schedule(path))
+    jobs, _, err = read_schedule(path)
+    if err:
+        raise ValueError(f"schedule file has an error, fix it first: {err}")
+    if ev["id"] in scheduled_ids(jobs):
+        raise ValueError(f"{ev_title(ev)} is already scheduled ({scheduled_ids(jobs)[ev['id']]['name']})")
+    if ev["status"] in ("finished", "canceled"):
+        raise ValueError(f"{ev_title(ev)} is {ev['desc'] or ev['status']}")
+    k = kickoff(ev)
+    slug = lambda s: re.sub(r"\s+", "-", s.strip().lower())
+    name = f"{k:%Y%m%d-%H%M}-{slug(ev['home'])}-{slug(ev['away'])}"
+    o = {**(opts or {}), "sofascore": ev["id"]}
+    n = _add_named(path, name, k, settings, url, page, o)
+    with sofa_state() as st:
+        st["events"][str(ev["id"])] = ev
+        st["skipped"].pop(str(ev["id"]), None)
+        st["watch"].pop(str(ev["id"]), None)
+    return n
+
+
+def _add_named(path, name, k, settings, url, page, opts):
+    jobs = read_schedule(path)[0]
+    base, n, i = safe_name(name), safe_name(name), 2
+    while n in jobs:
+        n, i = f"{base}-{i}", i + 1
+    return add_stream(path, k - dt.timedelta(minutes=settings["lead"]), url=url, page=page,
+                      end=k + dt.timedelta(hours=settings["max_hours"]), name=n, opts=opts)
+
+
+def sync_stream(path, job, ev, settings, t=None):
+    """Bring one SofaScore-linked stream in line with the match. Returns a log line or None."""
+    t = t or now()
+    name, k = job["name"], kickoff(ev)
+    launched = t >= job["start"] - dt.timedelta(minutes=int(job["opts"].get("lead", 3)))
+    lead, cap = dt.timedelta(minutes=settings["lead"]), k + dt.timedelta(hours=settings["max_hours"])
+    if ev["status"] in ("postponed", "canceled") and not launched:
+        raw = dict(job.get("raw") or {})
+        remove_stream(path, name, skip=False)
+        if ev["status"] == "postponed":  # re-added by the poller once it has a new date
+            with sofa_state() as st:
+                st["watch"][str(ev["id"])] = {"since": time.time(), "entry": {
+                    k2: v for k2, v in raw.items() if k2 not in ("name", "start", "end", "duration")}}
+        return f"[{name}] {ev_title(ev)} is {ev['status']} - removed" + (
+            " (will be re-added when it gets a new date)" if ev["status"] == "postponed" else "")
+    fields = {}
+    if ev["status"] in ("notstarted", "inprogress", "delayed", "interrupted", "willcontinue"):
+        if not launched and job["start"] != k - lead:
+            fields["start"] = k - lead
+        if job["end"] != cap and cap > t:
+            fields["end"] = cap
+    elif ev["status"] == "finished":
+        want = (t + dt.timedelta(minutes=settings["after"] + 1)).replace(second=0, microsecond=0)
+        want = max(want, job["start"] + dt.timedelta(minutes=1))
+        if job["end"] > want:
+            fields["end"] = want
+    if not fields:
+        return None
+    set_stream_fields(path, name, fields, drop=("duration",) if "end" in fields else ())
+    what = ", ".join(f"{k2} {v:%a %d %b %H:%M}" for k2, v in fields.items())
+    return f"[{name}] {ev_title(ev)} ({ev['desc'] or ev['status']}): {what}"
+
+
+def readd_watched(path, ev, watched, settings):
+    e = dict(watched.get("entry") or {})
+    page, url = e.pop("page", None), e.pop("url", None)
+    e.pop("sofascore", None)
+    return add_match(path, ev, page=page, url=url, opts=e, settings=settings)
+
+
+def sofa_poll(path, full=True, client=None, log_fn=None):
+    """One round: refresh linked streams (all, or just the ones near/at kickoff), follows, auto rules."""
+    say = log_fn or log.info
+    data = raw_schedule(path)
+    settings = sofa_settings(data)
+    jobs = parse_schedule(data)
+    pages = {p["name"]: p["url"] for p in data.get("page", [])}
+    follows = parse_follows(data, pages)
+    t = now()
+    linked = {i: j for i, j in scheduled_ids(jobs).items() if j["end"] > t}
+    hot = {i: j for i, j in linked.items() if j["start"] - dt.timedelta(minutes=30) <= t}
+    st = read_sofa_state()
+    watch = st.get("watch", {})
+    targets = linked if full else hot
+    if not targets and not (full and (follows or watch)):
+        return {"hot": False, "changes": []}
+    changes = []
+    own = client is None
+    s = Sofa().__enter__() if own else client
+    try:
+        seen = {}
+        for i, j in targets.items():
+            try:
+                ev = seen[i] = s.event(i)
+            except SofaError as e:
+                say(f"sofascore: {e}")
+                continue
+            msg = sync_stream(path, j, ev, settings, t)
+            if msg:
+                changes.append(msg)
+                say(msg)
+        upcoming = {}
+        if full:
+            for f in follows:
+                try:
+                    upcoming[f["key"]] = evs = s.next_events(f["kind"], f["id"])
+                except SofaError as e:
+                    say(f"sofascore: {f['name']}: {e}")
+                    upcoming[f["key"]] = st.get("upcoming", {}).get(f["key"], [])
+                    continue
+                if not f["auto"]:
+                    continue
+                horizon = t + dt.timedelta(days=settings["days"])
+                ids = scheduled_ids(read_schedule(path)[0])
+                for ev in evs:
+                    if (ev["status"] != "notstarted" or not ev["kickoff"] or ev["id"] in ids
+                            or str(ev["id"]) in st.get("skipped", {}) or str(ev["id"]) in watch
+                            or not (t < kickoff(ev) <= horizon)):
+                        continue
+                    try:
+                        n = add_match(path, ev, page=f["page"], url=f["url"], opts=f["opts"], settings=settings)
+                        changes.append(f"[{n}] scheduled {ev_title(ev)} ({f['name']})")
+                        say(changes[-1])
+                    except ValueError as e:
+                        say(f"sofascore: couldn't schedule {ev_title(ev)}: {e}")
+            for eid, w in list(watch.items()):
+                try:
+                    ev = s.event(int(eid))
+                except SofaError:
+                    continue
+                if ev["status"] == "canceled":
+                    with sofa_state() as st2:
+                        st2["watch"].pop(eid, None)
+                    say(f"sofascore: {ev_title(ev)} was canceled")
+                elif ev["status"] == "notstarted" and ev["kickoff"] and kickoff(ev) > t:
+                    try:
+                        n = readd_watched(path, ev, w, settings)
+                        changes.append(f"[{n}] {ev_title(ev)} has a new date - scheduled again")
+                        say(changes[-1])
+                    except ValueError as e:
+                        say(f"sofascore: couldn't re-add {ev_title(ev)}: {e}")
+        with sofa_state() as st2:
+            st2["events"].update({str(i): ev for i, ev in seen.items()})
+            if full:
+                st2["upcoming"] = upcoming
+                st2["updated"] = time.time()
+            st2["error"] = None
+    finally:
+        if own:
+            s.__exit__(None, None, None)
+    return {"hot": bool(hot), "changes": changes}
+
+
+def sofa_poller(path):
+    """Scheduler thread. Normal check every `poll` minutes; every 3 min around a linked match."""
+    last_full, fails, hot = 0.0, 0, False
+    while not STOP.is_set():
+        try:
+            data = raw_schedule(path)
+            poll = sofa_settings(data)["poll"] * 60
+            if not data.get("follow") and not any(isinstance(s.get("sofascore"), int) for s in data.get("stream", [])) \
+                    and not read_sofa_state().get("watch"):
+                STOP.wait(60)
+                continue
+            full = time.time() - last_full >= min(poll * 2 ** min(fails, 3), 6 * 3600)
+            r = sofa_poll(path, full=full)
+            hot, fails = r["hot"], 0
+            if full:
+                last_full = time.time()
+        except Exception as e:
+            fails += 1
+            last_full = time.time()  # back off the full refresh: 1x, 2x, 4x, 8x poll
+            log.warning("sofascore check failed (%s); keeping current times", e)
+            try:
+                with sofa_state() as st:
+                    st["error"] = f"{now():%H:%M}: {e}"
+            except OSError:
+                pass
+        STOP.wait(180 if hot else 60)
+
+
+# -- CLI
+def sofa_target(a):
+    if a.page and a.url:
+        sys.exit("give --page or --url, not both")
+    return a.page, a.url
+
+
+def cmd_sofa(a):
+    try:
+        if a.action == "test":
+            with Sofa() as s:
+                r = s.search(a.args[0] if a.args else "barcelona")
+                print(f"search ok: {len(r)} results" + (f", first: {r[0]['name']} ({r[0]['kind']} {r[0]['id']})" if r else ""))
+                if r:
+                    team = next((x for x in r if x["kind"] == "team"), None)
+                    if team:
+                        evs = s.next_events("team", team["id"])
+                        print(f"next matches for {team['name']}: {len(evs)}")
+                        for ev in evs[:3]:
+                            print(f"  {kickoff(ev):%a %d %b %H:%M}  {ev_title(ev)}  ({ev['tournament']}) id {ev['id']}")
+                        if evs:
+                            ev = s.event(evs[0]["id"])
+                            print(f"event lookup ok: {ev_title(ev)} - {ev['status']}")
+            print("SofaScore works from this machine.")
+        elif a.action == "search":
+            if not a.args:
+                sys.exit("usage: sofa search NAME")
+            with Sofa() as s:
+                for r in s.search(" ".join(a.args)):
+                    print(f"{r['kind']:10s} {r['id']:>8}  {r['name']}  ({', '.join(x for x in (r['sport'], r['where']) if x)})")
+        elif a.action == "matches":
+            data = raw_schedule(a.file)
+            follows = parse_follows(data, {p["name"]: p["url"] for p in data.get("page", [])})
+            if a.args:
+                kind, _, i = a.args[0].partition(":")
+                follows = [{"kind": kind, "id": int(i), "name": a.args[0], "key": a.args[0]}] if i else \
+                    [{"kind": "team", "id": int(kind), "name": kind, "key": kind}]
+            ids = scheduled_ids(read_schedule(a.file)[0])
+            with Sofa() as s:
+                for f in follows:
+                    print(f"{f['name']}:")
+                    for ev in s.next_events(f["kind"], f["id"])[:10]:
+                        mark = "  [scheduled]" if ev["id"] in ids else ""
+                        print(f"  {kickoff(ev):%a %d %b %H:%M}  {ev_title(ev)}  ({ev['tournament']})  id {ev['id']}{mark}")
+            if not follows:
+                print("not following anything yet: streamrec sofa follow team <id> --page NAME")
+        elif a.action == "follow":
+            if len(a.args) != 2 or a.args[0] not in ("team", "tournament") or not a.args[1].isdigit():
+                sys.exit("usage: sofa follow team|tournament ID [--name N] [--page P | --url U] [--auto]")
+            page, url = sofa_target(a)
+            follow(a.file, a.args[0], int(a.args[1]), a.name, page, url, a.auto, kv_opts(a.set))
+            print("following" + (" (auto-scheduling its matches)" if a.auto else ""))
+        elif a.action == "unfollow":
+            if not a.args:
+                sys.exit("usage: sofa unfollow team:ID | tournament:ID")
+            unfollow(a.file, a.args[0] if ":" in a.args[0] else f"team:{a.args[0]}")
+            print("unfollowed (already scheduled matches stay)")
+        elif a.action == "add":
+            if not a.args:
+                sys.exit("usage: sofa add LINK|ID (--page P | --url U)")
+            page, url = sofa_target(a)
+            if not (page or url):
+                sys.exit("say where to record it: --page NAME or --url URL")
+            with Sofa() as s:
+                ev = s.event(match_id(a.args[0]))
+            print("added", add_match(a.file, ev, page=page, url=url, opts=kv_opts(a.set)))
+        elif a.action == "poll":
+            r = sofa_poll(a.file, full=True, log_fn=print)
+            print(f"{len(r['changes'])} change(s)")
+    except (ValueError, SofaError) as e:
+        sys.exit(str(e))
+
+
+def follow(path, kind, id_, name=None, page=None, url=None, auto=False, opts=None):
+    if url and not re.match(r"https?://", url):
+        raise ValueError(f"not an http(s) URL: {url!r}")
+
+    def fn(text):
+        import tomllib
+
+        data = tomllib.loads(text) if text.strip() else {}
+        if any(f.get(kind) == id_ for f in data.get("follow", [])):
+            raise ValueError(f"already following {kind} {id_}")
+        fields = {kind: id_, "name": name, "page": page or None, "url": url or None, "auto": True if auto else None}
+        fields.update(opts or {})
+        return append_block(text, toml_block("follow", fields))
+
+    edit_schedule(path, fn)
+
+
+def unfollow(path, key):
+    def fn(text):
+        import tomllib
+
+        data = tomllib.loads(text)
+        pages = {p["name"]: p["url"] for p in data.get("page", [])}
+        fs = parse_follows(data, pages)
+        idx = next((f["index"] for f in fs if f["key"] == key), None)
+        if idx is None:
+            raise ValueError(f"not following {key}")
+        return cut_block(text, "follow", idx)
+
+    edit_schedule(path, fn)
+    with sofa_state() as st:
+        st["upcoming"].pop(key, None)
 
 
 # ----------------------------------------------------------------------------- CLI edits
@@ -1209,6 +1774,7 @@ def jobs_html(path, rec_dir):
         out.append('<div class="err">The scheduler is not running, so nothing will record.</div>')
     t = now()
     groups = {"Live": [], "Upcoming": [], "Past": []}
+    sofa_events = read_sofa_state().get("events", {})
     for r in rows:
         g = "Past" if r["end"] < t else "Live" if r["start"] - dt.timedelta(minutes=int(r["opts"].get("lead", 3))) <= t else "Upcoming"
         groups[g].append(r)
@@ -1231,6 +1797,9 @@ def jobs_html(path, rec_dir):
             if mode:
                 bits.append(e(mode))
             src = f"<b>{e(r['page'])}</b> · " if r["page"] else ""
+            sev = sofa_events.get(str(r["opts"].get("sofascore")))
+            if sev:
+                src = f"{e(ev_title(sev))} · {e(sev['desc'] or sev['status'])}<br>" + src
             live = r["end"] >= t and r["state"] != "upcoming"
             confirm = ("Stop this recording now and remove it? Parts already saved stay on disk."
                        if live else "Remove this entry? Recordings on disk are kept.")
@@ -1249,7 +1818,77 @@ def jobs_html(path, rec_dir):
     return "".join(out)
 
 
-def page_html(path, rec_dir, msg=None, err=None):
+def target_picker(pages, preset=None):
+    """Saved-page select + URL field, for forms that need to know where to record."""
+    opts = "".join(f'<option value="{e(n)}"{" selected" if n == preset else ""}>{e(n)}</option>' for n in pages)
+    sel = (f'<select name="page"><option value="">— URL below —</option>{opts}</select>' if pages else "")
+    return f'{sel}<input name="url" type="url" placeholder="stream page URL" autocomplete="off" style="margin-top:6px">'
+
+
+def matches_html(path, pages, search=None):
+    try:
+        follows = parse_follows(raw_schedule(path), pages)
+    except Exception:
+        follows = []
+    st = read_sofa_state()
+    ids = scheduled_ids(read_schedule(path)[0])
+    out = ['<h2>Matches (SofaScore)</h2>']
+    if st.get("error"):
+        out.append(f'<p class="mute">Last SofaScore check failed: {e(st["error"])}. Scheduled times are kept.</p>')
+    for f in follows:
+        target = f["page"] or (f["url"] and "URL") or "no stream page set"
+        out.append(f'<div class="card"><div class="row" style="align-items:center"><div><div class="name">{e(f["name"])}</div>'
+                   f'<div class="mute">{e(f["kind"])} {f["id"]} · {"auto → " if f["auto"] else "→ "}{e(target)}</div></div>'
+                   f'<form class="inline" method="post" action="sofa/unfollow" data-confirm="Unfollow {e(f["name"])}? '
+                   f'Scheduled matches stay."><input type="hidden" name="key" value="{e(f["key"])}">'
+                   f'<button class="del">Unfollow</button></form></div>')
+        evs = [v for v in st.get("upcoming", {}).get(f["key"], []) if v.get("kickoff")][:6]
+        if not evs:
+            out.append('<p class="mute">No upcoming matches known yet (checked every ~45 min).</p>')
+        for v in evs:
+            if v["id"] in ids:
+                right = '<span class="pill recording">scheduled</span>'
+            elif f["page"] or f["url"]:
+                right = (f'<form class="inline" method="post" action="sofa/add"><input type="hidden" name="event" '
+                         f'value="{v["id"]}"><input type="hidden" name="follow" value="{e(f["key"])}">'
+                         f'<button>Record</button></form>')
+            else:
+                right = ""
+            out.append(f'<div class="row" style="align-items:center;border-top:1px solid var(--line);padding-top:8px;'
+                       f'margin-top:8px"><div><div>{e(ev_title(v))}</div><div class="mute">{kickoff(v):%a %d %b %H:%M}'
+                       f' · {e(v["tournament"])}</div></div>{right}</div>')
+        out.append("</div>")
+    out.append('<form class="card" method="post" action="sofa/add"><label>Paste a SofaScore match link</label>'
+               '<input name="event" required placeholder="https://www.sofascore.com/…#id:12345678" autocomplete="off">'
+               f'<label>Record from</label>{target_picker(pages)}'
+               '<div style="margin-top:12px"><button>Schedule match</button></div></form>')
+    out.append('<form class="card" method="get" action="./"><label>Find a team or competition to follow</label>'
+               f'<div class="row"><input name="q" required value="{e(search or "")}" placeholder="e.g. Flamengo, '
+               'Premier League" autocomplete="off"><button>Search</button></div></form>')
+    if search:
+        res = None
+        try:
+            with Sofa() as sc:
+                res = sc.search(search)[:12]
+        except Exception as ex:
+            out.append(f'<div class="err">SofaScore search failed: {e(ex)}</div>')
+        if res == []:
+            out.append('<p class="mute">Nothing found.</p>')
+        for x in res or []:
+            meta = " · ".join(v for v in (x["kind"], x["sport"], x["where"]) if v)
+            out.append(
+                '<form class="card" method="post" action="sofa/follow">'
+                f'<input type="hidden" name="kind" value="{e(x["kind"])}"><input type="hidden" name="id" value="{x["id"]}">'
+                f'<input type="hidden" name="name" value="{e(x["name"])}"><div class="name">{e(x["name"])}</div>'
+                f'<div class="mute">{e(meta)}</div><details><summary>Follow…</summary>'
+                f'<label>Record its matches from</label>{target_picker(pages)}'
+                '<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="auto" value="1" '
+                'style="width:auto"> record every match automatically</label>'
+                '<div style="margin-top:10px"><button>Follow</button></div></details></form>')
+    return "".join(out)
+
+
+def page_html(path, rec_dir, msg=None, err=None, search=None):
     _, pages, _ = read_schedule(path)
     start = (now() + dt.timedelta(minutes=10)).replace(second=0, microsecond=0)
     start += dt.timedelta(minutes=-start.minute % 5)
@@ -1280,6 +1919,7 @@ def page_html(path, rec_dir, msg=None, err=None):
 <option>auto</option><option>grab</option><option>screen</option></select></div>
 <div><label>Duration (instead of end)</label><input name="duration" placeholder="e.g. 2h30m" autocomplete="off"></div></div>
 </details><div style="margin-top:14px"><button class="go">Schedule</button></div></form>
+{matches_html(path, pages, search)}
 <h2>Saved pages</h2>{page_list}
 <form class="card" method="post" action="page/add"><div class="two">
 <div><label>Name</label><input name="name" required placeholder="channel 1" autocomplete="off"></div>
@@ -1342,7 +1982,7 @@ def make_handler(path, rec_dir):
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             p = u.path.rstrip("/") or "/"
             if p == "/":
-                self.send(200, page_html(path, rec_dir, q.get("msg"), q.get("err")))
+                self.send(200, page_html(path, rec_dir, q.get("msg"), q.get("err"), q.get("q")))
             elif p == "/jobs":
                 self.send(200, jobs_html(path, rec_dir))
             elif p == "/manifest.webmanifest":
@@ -1378,6 +2018,33 @@ def make_handler(path, rec_dir):
             f = {k: v[0].strip() for k, v in parse_qs(self.rfile.read(n).decode()).items()}
             p = urlparse(self.path).path
             try:
+                if p.endswith("sofa/follow"):
+                    if f.get("kind") not in ("team", "tournament") or not f.get("id", "").isdigit():
+                        raise ValueError("bad follow request")
+                    follow(path, f["kind"], int(f["id"]), f.get("name") or None, f.get("page") or None,
+                           None if f.get("page") else f.get("url") or None, bool(f.get("auto")))
+                    threading.Thread(target=_quiet, args=(sofa_poll, path, True), daemon=True).start()
+                    return self.redirect(msg=f"Following {f.get('name')} - its matches show up in a few seconds")
+                if p.endswith("sofa/unfollow"):
+                    unfollow(path, f.get("key", ""))
+                    return self.redirect(msg="Unfollowed")
+                if p.endswith("sofa/add"):
+                    eid = match_id(f.get("event", ""))
+                    page, url = f.get("page") or None, None if f.get("page") else f.get("url") or None
+                    opts = {}
+                    if f.get("follow"):
+                        data = raw_schedule(path)
+                        pages = {g["name"]: g["url"] for g in data.get("page", [])}
+                        fl = next((x for x in parse_follows(data, pages) if x["key"] == f["follow"]), None)
+                        if not fl:
+                            raise ValueError("that follow is gone")
+                        page, url, opts = fl["page"], fl["url"], fl["opts"]
+                    if not (page or url):
+                        raise ValueError("pick a saved page or enter the stream URL to record from")
+                    with Sofa() as sc:
+                        ev = sc.event(eid)
+                    name = add_match(path, ev, page=page, url=url, opts=opts)
+                    return self.redirect(msg=f"Scheduled {ev_title(ev)} ({name})")
                 if p.endswith("/add") and not p.endswith("page/add"):
                     opts = {"mode": f["mode"]} if f.get("mode") in ("auto", "grab", "screen") else {}
                     name = add_stream(path, f.get("start", ""), url=f.get("url") if not f.get("page") else None,
@@ -1394,11 +2061,18 @@ def make_handler(path, rec_dir):
                 if p.endswith("/remove"):
                     remove_stream(path, f.get("name", ""))
                     return self.redirect(msg=f"Removed {f.get('name')}")
-            except (ValueError, argparse.ArgumentTypeError) as ex:
+            except (ValueError, argparse.ArgumentTypeError, SofaError) as ex:
                 return self.redirect(err=str(ex))
             self.send(404, "not found\n", "text/plain")
 
     return H
+
+
+def _quiet(fn, *args):
+    try:
+        fn(*args)
+    except Exception as ex:
+        log.warning("sofascore: %s", ex)
 
 
 def tailscale_ip():
@@ -1562,6 +2236,26 @@ def build_parser():
     pg.add_argument("url", nargs="?")
     sched_file(pg)
     pg.set_defaults(fn=cmd_page)
+
+    so = sub.add_parser("sofa", formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="SofaScore: search, follow teams/competitions, schedule matches",
+                        description="""SofaScore matches
+  sofa test [NAME]                      check that SofaScore answers from this machine
+  sofa search NAME                      find team / competition ids
+  sofa follow team|tournament ID [--name N] [--page P | --url U] [--auto] [--set k=v]
+  sofa unfollow team:ID|tournament:ID
+  sofa matches [team:ID]                upcoming matches of what you follow
+  sofa add LINK|ID (--page P | --url U) schedule one match (pasted sofascore.com link or id)
+  sofa poll                             do one update round now (the scheduler does this itself)""")
+    so.add_argument("action", choices=["test", "search", "follow", "unfollow", "matches", "add", "poll"])
+    so.add_argument("args", nargs="*")
+    so.add_argument("--name")
+    so.add_argument("--page", help="saved page to record from")
+    so.add_argument("--url", help="stream page URL to record from")
+    so.add_argument("--auto", action="store_true", help="follow: schedule every match automatically")
+    so.add_argument("--set", action="append", metavar="KEY=VALUE", help="record option for its streams")
+    sched_file(so)
+    so.set_defaults(fn=cmd_sofa)
 
     w = sub.add_parser("web", help="serve the phone page (also: schedule --web)", formatter_class=fmt)
     w.add_argument("--bind", default="auto", help="ADDR[:PORT]; 'auto' = tailscale address, port 8787")

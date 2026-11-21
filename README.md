@@ -127,6 +127,34 @@ Keep it private:
 - For HTTPS (and a full install prompt on Android), bind it to `--web 127.0.0.1:8787` and run
   `tailscale serve --bg 8787`, which makes it `https://<machine>.<tailnet>.ts.net/` inside your tailnet only.
 
+### SofaScore matches
+
+Record matches without typing times: follow a team or competition and the times come from SofaScore.
+
+```bash
+streamrec sofa test                                   # once: check SofaScore answers from this machine
+streamrec sofa search "flamengo"                      # -> team 5981, tournament 325, ...
+streamrec sofa follow team 5981 --name Flamengo --page "channel 1" --auto
+streamrec sofa matches                                # upcoming matches of what you follow
+streamrec sofa add "https://www.sofascore.com/...#id:12345678" --page "channel 1"   # one match
+```
+
+The same is on the web page, under "Matches": search, follow, "Record" on a match, or paste a match link.
+
+How a match entry is timed (the scheduler checks every 45 min, and every 3 min from 30 min before kickoff):
+- **Start:** kickoff − 10 min. If the kickoff moves, the start moves with it.
+- **End:** kickoff + 4 h until the match is finished, then 10 min after the final whistle.
+- **Postponed or cancelled** before recording started: the entry is removed. A postponed match is added back
+  automatically when it gets a new date.
+- **Removing** a match entry yourself makes auto rules leave that match alone.
+- **SofaScore down or blocking:** entries keep their last known times, so nothing is lost; it retries with backoff.
+  The page shows the last error.
+
+Change the timings in a `[sofascore]` table (`lead`, `after`, `max_hours`, `poll`, `days`); see `schedule.example.toml`.
+Matches are ordinary `[[stream]]` entries with a `sofascore = <match id>` key, so `list`, `remove` and the page treat
+them like any other recording. SofaScore has no official API: if it changes, only the `sofascore` section of
+`streamrec.py` needs fixing.
+
 ## Output
 
 ```
