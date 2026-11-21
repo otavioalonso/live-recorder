@@ -1,0 +1,23 @@
+# ~/.config/streamrec/schedule.toml
+# The scheduler re-reads this file every 15 s, so just edit and save; no restart needed.
+# Check it with:  streamrec.py schedule --check
+
+[defaults]            # applied to every stream; any `record` option works (--part -> part)
+mode = "auto"         # auto | grab | screen
+part = "5m"
+lead = 3              # minutes before start to begin trying
+# rclone = "gdrive:streams"
+# extension = "~/uBOLite"
+# inhibit_sleep = true   # stop the computer suspending while recording (desktop/laptop)
+
+[[stream]]
+name  = "keynote"                       # folder name (optional)
+url   = "https://example.com/live"
+start = 2026-11-25T21:00:00             # local time; a full date is required
+end   = 2026-11-25T23:30:00             # pad it: it keeps retrying until then
+
+[[stream]]
+url      = "https://example.org/watch?id=123"
+start    = 2026-11-28T09:00:00
+duration = "3h"                         # instead of end
+mode     = "screen"                     # per-stream override
