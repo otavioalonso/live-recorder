@@ -131,6 +131,7 @@ esac
 "$BIN" schedule "$SCHEDULE" --check >/dev/null 2>&1 \
   || warn "schedule file has errors: run '$NAME schedule --check'"
 
+TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
 cat <<EOF
 
 $(say "done")
@@ -138,7 +139,7 @@ $(say "done")
   quick test:      $NAME record URL --duration 5m --part 1m
   edit schedule:   \$EDITOR $SCHEDULE      (check: $NAME schedule --check)
   or:              $NAME add URL --start 21:00 --duration 2h   ($NAME list / remove / page)
-  phone page:      http://$(tailscale ip -4 2>/dev/null | head -1 || echo '<tailscale-ip>'):8787/
+  phone page:      http://${TS_IP:-<tailscale-ip>}:8787/
   service:         systemctl --user $( ((ENABLE)) && echo status || echo "enable --now") $NAME
   service log:     journalctl --user -u $NAME -f
   recordings:      $REC_DIR/<name>/        (join: $NAME join DIR)
