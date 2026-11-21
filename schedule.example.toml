@@ -32,17 +32,3 @@ url  = "https://example.net/live/1"
 page  = "channel 1"
 start = 2026-11-30T20:00:00
 end   = 2026-11-30T22:30:00
-
-# SofaScore (optional). Find ids with: streamrec sofa search "team name"
-# Matches start recording 10 min before kickoff and follow kickoff changes and postponements;
-# they end 10 min after the final whistle (at most 4 h after kickoff).
-# [sofascore]
-# lead = 10
-# after = 10
-# max_hours = 4
-#
-# [[follow]]
-# team = 5981               # or: tournament = 325
-# name = "Flamengo"
-# page = "channel 1"        # where its matches are recorded (or url = "...")
-# auto = true               # schedule every match automatically
