@@ -77,7 +77,9 @@ loginctl enable-linger $USER          # keep it running when you're logged out
 
 Day-to-day use:
 - Edit `~/.config/streamrec/schedule.toml` and save. The scheduler re-reads it every 15 s, so there's nothing to restart.
+  Or use the commands below, or the web page.
 - `python ~/streamrec/streamrec.py schedule --check` checks the file and lists upcoming streams.
+- `streamrec list` shows each stream's status: upcoming, recording, retrying, done or missed, with parts, size and restarts.
 - `journalctl --user -u streamrec -f` shows the scheduler's log: launches, restarts, finished recordings.
 - Each recording gets its own folder under `~/recordings/<name>/`, with `recorder.log` and `console.log` inside.
 
@@ -90,6 +92,40 @@ How it behaves:
 - **Errors in the file:** if you save the file with a typo, the scheduler keeps using the previous version and logs the error.
 - **Removing a stream:** a running stream that you delete from the file is stopped.
 - **Changing an end time:** if you extend a stream's end time after it finished, it records again.
+
+### Editing the schedule from the command line
+
+```bash
+streamrec add https://example.com/live --start 2026-11-30T21:00 --end 23:30
+streamrec add "channel 1" --start 21:00 --duration 2h --mode screen --set lead=10
+streamrec remove 20261130-2100-example.com      # stops it if running; files stay on disk
+streamrec page add "channel 1" https://example.net/live/1
+streamrec page list
+```
+
+`add` takes a URL or the name of a saved page. `--start HH:MM` means the next time that clock time comes round,
+and it's written to the file as a full date. Any `record` option can be given with `--set key=value`.
+
+Every edit is checked with the same loader the scheduler uses before the file is replaced, so a bad option or a past
+end time is refused instead of saved. Your comments and layout are kept, and the previous version is saved as
+`schedule.toml.bak`. Removing an entry never deletes recordings.
+
+### Web page (phone)
+
+`streamrec schedule --web` (the systemd unit has this on) also serves a small page for the schedule, on this machine's
+Tailscale address at port 8787. Open `http://<tailscale-ip>:8787/` on your phone and add it to the home screen.
+Standalone: `streamrec web [--bind ADDR:PORT]`.
+
+From the page you can see what's live, upcoming and past (state, parts, size, restarts, last data, logs),
+schedule a URL or a saved page with date/time pickers, stop or remove entries, and manage saved pages.
+
+Keep it private:
+- **Don't port-forward it.** It has no login. It only answers clients on loopback, Tailscale (100.64.0.0/10) and private LAN
+  addresses, and refuses public IPs even if something forwards a port to it.
+- By default it binds to the Tailscale address only. If Tailscale isn't up yet it retries every 30 s.
+  Use `--web 192.168.1.10:8787` to bind a LAN address instead.
+- For HTTPS (and a full install prompt on Android), bind it to `--web 127.0.0.1:8787` and run
+  `tailscale serve --bg 8787`, which makes it `https://<machine>.<tailnet>.ts.net/` inside your tailnet only.
 
 ## Output
 

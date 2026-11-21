@@ -3,7 +3,7 @@
 Description=streamrec scheduler (records streams listed in ~/.config/streamrec/schedule.toml)
 
 [Service]
-ExecStart=%h/.venvs/streamrec/bin/python %h/streamrec/streamrec.py schedule %h/.config/streamrec/schedule.toml --dir %h/recordings
+ExecStart=%h/.venvs/streamrec/bin/python %h/streamrec/streamrec.py schedule %h/.config/streamrec/schedule.toml --dir %h/recordings --web
 Restart=always
 RestartSec=10
 # let the scheduler stop its recordings cleanly; systemd kills leftovers afterwards
