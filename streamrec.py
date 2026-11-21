@@ -175,6 +175,20 @@ class Browser:
         if sniff:
             self.ctx.on("response", self._on_response)
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+        self.home = None
+        self.page.route("**/*", self._guard)
+
+    def _guard(self, route):
+        """Refuse ad redirects of the main tab to another site (they'd repeat on every reload)."""
+        r = route.request
+        try:
+            if (self.home and r.is_navigation_request() and r.frame == self.page.main_frame
+                    and not same_site(r.url, self.home)):
+                log.info("blocked redirect to %s", r.url[:80])
+                return route.fulfill(status=204, body="")
+        except Exception:
+            pass
+        route.fallback()
 
     def _on_new_page(self, p):
         if self.page is not None and p is not self.page:
@@ -263,7 +277,9 @@ class Browser:
 
     def open_and_play(self, url, timeout):
         """Load the page and click until a video plays (or, when sniffing, a playlist shows up)."""
+        self.home = None
         self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        self.home = self.page.url  # after the site's own redirects
         deadline, last = time.time() + timeout, None
         while time.time() < deadline and not STOP.is_set():
             self.page.wait_for_timeout(3000)
@@ -304,12 +320,30 @@ class Browser:
 
 
 # ----------------------------------------------------------------------------- grab mode
+_HLS_HELP = None
+
+
+def hls_input_opts(url):
+    """ffmpeg refuses HLS with odd extensions (.txt playlists, .jpg/.png segments) unless told."""
+    global _HLS_HELP
+    if re.search(r"\.mpd(\?|#|$)", url, re.I):
+        return []
+    if _HLS_HELP is None:
+        _HLS_HELP = subprocess.run(["ffmpeg", "-hide_banner", "-h", "demuxer=hls"],
+                                   capture_output=True, text=True).stdout
+    opts = ["-f", "hls", "-allowed_extensions", "ALL"]
+    if "extension_picky" in _HLS_HELP:  # ffmpeg >= 7.1
+        opts += ["-extension_picky", "0"]
+    return opts
+
+
 def grab_cmd(a, url, h, pattern):
     hdr = "".join(f"{k}: {v}\r\n" for k, v in h.items() if k.lower() in FWD_HEADERS)
     return ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
             "-user_agent", h.get("user-agent", "Mozilla/5.0"),
             *(["-headers", hdr] if hdr else []),
             "-rw_timeout", "20000000",
+            *hls_input_opts(url),
             "-i", url,
             "-c", "copy", "-f", "segment", "-segment_time", str(a.part),
             "-reset_timestamps", "1", "-segment_format", "mpegts", pattern]
@@ -332,9 +366,10 @@ def grab_session(a, out, end):
     b = Browser(a, sniff=True)
     ff = None
     try:
-        if not b.open_and_play(a.url, a.find_timeout):
-            return "no playlist found"
+        b.open_and_play(a.url, a.find_timeout)
         b.page.wait_for_timeout(4000)  # let the master playlist / variants arrive
+        if not b.found:  # e.g. the video plays, but not from HLS/DASH (mp4, MSE with odd URLs)
+            return "no playlist found"
         url, headers, _ = b.best_playlist()
         if not a.keep_browser:
             b.close()
@@ -540,8 +575,12 @@ def cmd_join(a):
     lst = d / "parts.txt"
     lst.write_text("".join("file '%s'\n" % str(p.resolve()).replace("'", "'\\''") for p in parts))
     out = a.output or str(d / "joined.mkv")
-    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "warning", "-f", "concat", "-safe", "0",
-                    "-i", str(lst), "-c", "copy", out], check=True)
+    if Path(out).exists():
+        sys.exit(f"{out} already exists (move it away or pass -o)")
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-n", "-f", "concat",
+                        "-safe", "0", "-i", str(lst), "-c", "copy", out])
+    if r.returncode:
+        sys.exit(f"ffmpeg failed (code {r.returncode})")
     print(f"joined {len(parts)} parts -> {out}")
 
 
