@@ -24,9 +24,15 @@ Subcommands
   login  URL       open a visible browser with the recorder's profile (log in, accept cookies)
   join   DIR       join all parts into one file
   schedule FILE    run every recording listed in a TOML schedule file (for a systemd service)
+  list / add / remove / page   view and edit the schedule file from the command line
+  web              phone page for the schedule (Tailscale/LAN only); or `schedule --web`
 """
 import argparse
 import datetime as dt
+import fcntl
+import html
+import ipaddress
+import json
 import logging
 import os
 import re
@@ -36,11 +42,17 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 log = logging.getLogger("streamrec")
 STOP = threading.Event()
+KICK = threading.Event()  # wakes the scheduler loop early (schedule edited from the web page)
+STATE_DIR = Path("~/.streamrec").expanduser()
+STATUS = STATE_DIR / "status.json"
+DEFAULT_SCHEDULE = "~/.config/streamrec/schedule.toml"
+DEFAULT_DIR = "~/recordings"
 
 PLAYLIST_URL = re.compile(r"\.(m3u8|mpd)(\?|#|$)", re.I)
 PLAYLIST_CT = ("mpegurl", "dash+xml")
@@ -554,12 +566,28 @@ def load_schedule(path):
 
     with open(path, "rb") as f:
         data = tomllib.load(f)
+    return parse_schedule(data)
+
+
+def parse_schedule(data):
     defaults = data.get("defaults", {})
+    pages = {}
+    for i, pg in enumerate(data.get("page", []), 1):
+        if not isinstance(pg.get("name"), str) or not isinstance(pg.get("url"), str):
+            raise ValueError(f"page #{i}: needs a name and a url")
+        if pg["name"] in pages:
+            raise ValueError(f"duplicate page name {pg['name']!r}")
+        pages[pg["name"]] = pg["url"]
     jobs = {}
     for i, entry in enumerate(data.get("stream", []), 1):
         j = {**defaults, **entry}
+        page = j.pop("page", None)
+        if page is not None and "url" not in entry:
+            if page not in pages:
+                raise ValueError(f"stream #{i}: unknown page {page!r}")
+            j["url"] = pages[page]
         if "url" not in j or "start" not in j or not ("end" in j or "duration" in j):
-            raise ValueError(f"stream #{i}: needs url, start, and end or duration")
+            raise ValueError(f"stream #{i}: needs url (or page), start, and end or duration")
         start = to_dt(j.pop("start"), what=f"stream #{i} start")
         if "end" in j:
             end = to_dt(j.pop("end"), base=start, what=f"stream #{i} end")
@@ -570,11 +598,46 @@ def load_schedule(path):
             raise ValueError(f"stream #{i}: end is before start")
         url = j.pop("url")
         name = j.pop("name", None) or f"{start:%Y%m%d-%H%M}-{urlparse(url).hostname}"
-        name = re.sub(r"[^\w.-]+", "_", str(name))
+        name = safe_name(name)
         if name in jobs:
             raise ValueError(f"duplicate stream name {name!r}")
-        jobs[name] = {"name": name, "url": url, "start": start, "end": end, "opts": j}
+        job = {"name": name, "url": url, "page": page, "start": start, "end": end, "opts": j,
+               "index": i - 1}
+        check_opts(job)
+        jobs[name] = job
     return jobs
+
+
+def safe_name(name):
+    return re.sub(r"[^\w.-]+", "_", str(name)).strip("._") or "stream"
+
+
+def record_argv(job, out, profile, display):
+    """The `record` command line for a schedule entry (without the program itself)."""
+    argv = ["record", job["url"], "--start", job["start"].isoformat(), "--end", job["end"].isoformat(),
+            "--out", str(out), "--profile", str(profile), "--display", str(display)]
+    for k, v in job["opts"].items():
+        if k in SCHED_ONLY or k == "profile" or v is False:
+            continue
+        argv.append("--" + k.replace("_", "-"))
+        if v is not True:
+            argv.append(str(v))
+    return argv
+
+
+def check_opts(job):
+    """Reject unknown/invalid record options now instead of letting the recorder crash-loop."""
+    for k in job["opts"]:
+        if k in ("start", "end", "duration", "out", "display", "help"):
+            raise ValueError(f"stream {job['name']!r}: option {k!r} can't be set here")
+    try:
+        rp = build_parser().record
+        rp.raise_errors = True
+        rp.parse_args(record_argv(job, "x", "x", 99)[1:])
+    except ArgError as e:
+        raise ValueError(f"stream {job['name']!r}: {e}") from None
+    if "lead" in job["opts"]:
+        int(job["opts"]["lead"])
 
 
 class Running:
@@ -585,6 +648,9 @@ class Running:
         self.next_try = 0.0
         self.done = False
         self.end = None
+        self.launches = 0
+        self.started = None
+        self.last_exit = None
 
 
 def kill_group(proc, name, timeout=60):
@@ -611,21 +677,31 @@ def launch(job, rt, a, used_displays):
     prof = Path("~/.streamrec/jobs").expanduser() / name / "profile"
     if not prof.exists() and base_prof.exists():
         shutil.copytree(base_prof, prof, ignore=shutil.ignore_patterns("Singleton*"), symlinks=True)
-    cmd = [sys.executable, str(Path(__file__).resolve()), "record", job["url"],
-           "--start", job["start"].isoformat(), "--end", job["end"].isoformat(),
-           "--out", str(out), "--profile", str(prof), "--display", str(rt.display)]
-    for k, v in o.items():
-        if k in SCHED_ONLY or v is False:
-            continue
-        cmd.append("--" + k.replace("_", "-"))
-        if v is not True:
-            cmd.append(str(v))
+    cmd = [sys.executable, str(Path(__file__).resolve())] + record_argv(job, out, prof, rt.display)
     if o.get("inhibit_sleep") and shutil.which("systemd-inhibit"):
         cmd = ["systemd-inhibit", "--what=sleep:idle", "--who=streamrec", f"--why=recording {name}"] + cmd
     log.info("[%s] launching (until %s)", name, f"{job['end']:%Y-%m-%d %H:%M}")
     console = open(out / "console.log", "ab")
     rt.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=console, stderr=console,
                                start_new_session=True)
+    rt.launches += 1
+    rt.started = time.time()
+
+
+def write_status(state, a):
+    """Scheduler -> status.json, read by `list` and the web page."""
+    data = {"updated": time.time(), "pid": os.getpid(), "dir": str(Path(a.dir).expanduser()),
+            "jobs": {n: {"running": bool(rt.proc and rt.proc.poll() is None), "launches": rt.launches,
+                         "fails": rt.fails, "done": rt.done, "started": rt.started,
+                         "last_exit": rt.last_exit, "next_try": rt.next_try}
+                     for n, rt in state.items()}}
+    try:
+        STATUS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATUS.with_name(f".status.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, STATUS)
+    except OSError as e:
+        log.debug("status: %s", e)
 
 
 def cmd_schedule(a):
@@ -640,6 +716,9 @@ def cmd_schedule(a):
         print(f"{len(jobs)} stream(s) OK")
         return
 
+    if a.web:
+        threading.Thread(target=serve_web, args=(a.web, path, Path(a.dir).expanduser()),
+                         daemon=True).start()
     grace = dt.timedelta(minutes=2)
     jobs, state, warned = {}, {}, False
     log.info("scheduler started; watching %s, recordings go to %s", path, Path(a.dir).expanduser())
@@ -666,6 +745,7 @@ def cmd_schedule(a):
                 rt.end, rt.done = j["end"], False
             if rt.proc and rt.proc.poll() is not None:
                 code, rt.proc = rt.proc.returncode, None
+                rt.last_exit = code
                 if t < j["end"] - dt.timedelta(seconds=30):
                     rt.fails += 1
                     wait = min(300, 10 * 2 ** (rt.fails - 1))
@@ -686,7 +766,9 @@ def cmd_schedule(a):
             if not alive and not rt.done and t >= j["start"] - lead and time.time() >= rt.next_try:
                 used = {r.display for r in state.values() if r.proc}
                 launch(j, rt, a, used)
-        STOP.wait(15)
+        write_status(state, a)
+        KICK.wait(15)
+        KICK.clear()
 
     for name, rt in state.items():
         if rt.proc:
@@ -694,9 +776,664 @@ def cmd_schedule(a):
     log.info("scheduler stopped")
 
 
-def main():
-    p = argparse.ArgumentParser(description="Record a live stream from a web page.",
-                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+# ----------------------------------------------------------------------------- schedule editing
+# add/remove edit schedule.toml as text, so your comments and layout survive. Every edit is
+# locked, validated with the same loader the scheduler uses, and swapped in atomically
+# (the previous version is kept as schedule.toml.bak). Recordings on disk are never touched.
+HEADER = re.compile(r"^[ \t]*(\[\[?)[ \t]*([\w.-]+)[ \t]*\]\]?[ \t]*(#.*)?$")
+
+
+def toml_val(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, dt.datetime):  # written as local time, like a hand-written entry
+        return v.astimezone().strftime("%Y-%m-%dT%H:%M:%S")
+    v = str(v)
+    if re.search(r"[\x00-\x1f\x7f]", v):
+        raise ValueError(f"control characters not allowed: {v!r}")
+    return json.dumps(v, ensure_ascii=False)  # a JSON string is a valid TOML basic string
+
+
+def toml_block(table, fields):
+    return f"[[{table}]]\n" + "".join(f"{k} = {toml_val(v)}\n" for k, v in fields.items() if v is not None)
+
+
+def blocks(text, table):
+    """(first_line, end_line) of each [[table]] block; trailing comments stay with the next block."""
+    lines = text.splitlines(keepends=True)
+    heads = [(i, m[1] == "[[" and m[2] == table) for i, ln in enumerate(lines) if (m := HEADER.match(ln))]
+    out = []
+    for n, (i, mine) in enumerate(heads):
+        if not mine:
+            continue
+        end = heads[n + 1][0] if n + 1 < len(heads) else len(lines)
+        while end > i + 1 and (not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")):
+            end -= 1
+        out.append((i, end))
+    return lines, out
+
+
+def cut_block(text, table, index):
+    lines, bl = blocks(text, table)
+    i, end = bl[index]
+    if i > 0 and not lines[i - 1].strip():  # take one blank line before it too
+        i -= 1
+    return "".join(lines[:i] + lines[end:])
+
+
+def append_block(text, block):
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + ("\n" if text.strip() else "") + block
+
+
+@contextmanager
+def schedule_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+
+
+def edit_schedule(path, fn):
+    """fn(old_text) -> new_text; validated and swapped in atomically."""
+    import tomllib
+
+    path = Path(path).expanduser().resolve()
+    with schedule_lock(path):
+        old = path.read_text() if path.exists() else ""
+        if old.strip():
+            try:
+                load_schedule(path)
+            except Exception as e:
+                raise ValueError(f"{path} has an error, fix it first: {e}") from None
+        new = fn(old)
+        parse_schedule(tomllib.loads(new))  # raises -> nothing is written
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(new)
+        if old:
+            shutil.copy2(path, path.with_name(path.name + ".bak"))
+        os.replace(tmp, path)
+    KICK.set()
+
+
+def read_schedule(path):
+    """(jobs, pages, error) - never raises, for list/web."""
+    import tomllib
+
+    path = Path(path).expanduser()
+    try:
+        data = tomllib.loads(path.read_text())
+        pages = {p.get("name"): p.get("url") for p in data.get("page", [])}
+        return parse_schedule(data), pages, None
+    except FileNotFoundError:
+        return {}, {}, None
+    except Exception as e:
+        return {}, {}, str(e)
+
+
+def add_stream(path, start, url=None, page=None, end=None, duration=None, name=None, opts=None):
+    """Add a [[stream]]; returns its name. start/end: datetime or anything parse_when takes."""
+    if bool(url) == bool(page):
+        raise ValueError("give either a URL or a saved page")
+    if url and not re.match(r"https?://", url):
+        raise ValueError(f"not an http(s) URL: {url!r}")
+    start = start if isinstance(start, dt.datetime) else parse_when(str(start).strip())
+    start = start.replace(second=0, microsecond=0)
+    if end:
+        end = end if isinstance(end, dt.datetime) else parse_when(str(end).strip(), base=start)
+        duration = None
+    elif duration:
+        parse_duration(str(duration))
+    else:
+        raise ValueError("give an end time or a duration")
+    stop = end or start + parse_duration(str(duration))
+    if stop <= start:
+        raise ValueError("end is before start")
+    if stop <= now():
+        raise ValueError("that ends in the past")
+    holder = {}
+
+    def fn(text):
+        jobs, _, _ = read_schedule_text(text)
+        base = safe_name(name or f"{start:%Y%m%d-%H%M}-{page or urlparse(url).hostname}")
+        n, k = base, 2
+        while n in jobs:
+            if name:
+                raise ValueError(f"there is already a stream called {n!r}")
+            n, k = f"{base}-{k}", k + 1
+        holder["name"] = n
+        fields = {"name": n, "url": url, "page": page, "start": start, "end": end, "duration": duration}
+        fields.update(opts or {})
+        return append_block(text, toml_block("stream", fields))
+
+    edit_schedule(path, fn)
+    return holder["name"]
+
+
+def read_schedule_text(text):
+    import tomllib
+
+    data = tomllib.loads(text) if text.strip() else {}
+    return parse_schedule(data), {p["name"]: p["url"] for p in data.get("page", [])}, None
+
+
+def remove_stream(path, name):
+    def fn(text):
+        jobs, _, _ = read_schedule_text(text)
+        if name not in jobs:
+            raise ValueError(f"no stream called {name!r}")
+        return cut_block(text, "stream", jobs[name]["index"])
+
+    edit_schedule(path, fn)
+
+
+def add_page(path, name, url):
+    name = str(name).strip()
+    if not name:
+        raise ValueError("a page needs a name")
+    if not re.match(r"https?://", url or ""):
+        raise ValueError(f"not an http(s) URL: {url!r}")
+
+    def fn(text):
+        if name in read_schedule_text(text)[1]:
+            raise ValueError(f"there is already a page called {name!r}")
+        return append_block(text, toml_block("page", {"name": name, "url": url}))
+
+    edit_schedule(path, fn)
+
+
+def remove_page(path, name):
+    import tomllib
+
+    def fn(text):
+        data = tomllib.loads(text)
+        names = [p.get("name") for p in data.get("page", [])]
+        if name not in names:
+            raise ValueError(f"no page called {name!r}")
+        users = [j["name"] for j in parse_schedule(data).values() if j["page"] == name]
+        if users:
+            raise ValueError(f"page {name!r} is used by: {', '.join(users)}")
+        return cut_block(text, "page", names.index(name))
+
+    edit_schedule(path, fn)
+
+
+# ----------------------------------------------------------------------------- status
+def read_status():
+    try:
+        st = json.loads(STATUS.read_text())
+    except (OSError, ValueError):
+        return None
+    st["alive"] = time.time() - st.get("updated", 0) < 60
+    return st
+
+
+def disk_info(out):
+    parts = list(out.glob("run*_*.ts")) if out.is_dir() else []
+    stats = [p.stat() for p in parts]
+    runs = {p.name.split("_")[0] for p in parts}
+    return {"parts": len(parts), "runs": len(runs), "bytes": sum(s.st_size for s in stats),
+            "last": max((s.st_mtime for s in stats), default=None)}
+
+
+def job_rows(path, rec_dir):
+    """Everything list/web show: one dict per stream, sorted by start, plus the load error."""
+    jobs, pages, err = read_schedule(path)
+    st = read_status() or {"jobs": {}, "alive": False}
+    rec_dir = Path(st.get("dir") or rec_dir).expanduser() if st.get("alive") else Path(rec_dir).expanduser()
+    t = now()
+    rows = []
+    for j in sorted(jobs.values(), key=lambda j: j["start"]):
+        s = st["jobs"].get(j["name"], {}) if st["alive"] else {}
+        d = disk_info(rec_dir / j["name"])
+        fresh = d["last"] and time.time() - d["last"] < 120
+        if s.get("running"):
+            state = ("recording" if fresh else "retrying" if s.get("fails", 0) >= 2
+                     else "starting" if time.time() - (s.get("started") or 0) < 180 else "no data")
+        elif j["end"] < t:
+            state = "done" if d["parts"] else "missed"
+        elif j["start"] - dt.timedelta(minutes=int(j["opts"].get("lead", 3))) <= t:
+            state = "retrying" if s.get("fails") else "due"
+        else:
+            state = "upcoming"
+        rows.append({**j, **d, "state": state, "launches": s.get("launches", 0),
+                     "restarts": max(0, s.get("launches", 0) - 1), "last_exit": s.get("last_exit")})
+    return rows, pages, err, st, rec_dir
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def ago(ts):
+    s = int(time.time() - ts)
+    return f"{s}s ago" if s < 120 else f"{s // 60}m ago" if s < 7200 else f"{s // 3600}h ago"
+
+
+# ----------------------------------------------------------------------------- CLI edits
+def cmd_list(a):
+    rows, pages, err, st, _ = job_rows(a.file, a.dir)
+    if err:
+        print(f"!! schedule file error (scheduler keeps the last good version): {err}")
+    if not st["alive"]:
+        print("!! scheduler is not running (no fresh status.json)")
+    for r in rows:
+        if r["end"] < now() - dt.timedelta(days=a.days) and not a.all:
+            continue
+        src = f"[{r['page']}] " if r["page"] else ""
+        disk = f"{r['parts']} parts, {human_size(r['bytes'])}" if r["parts"] else "no parts yet"
+        extra = f", {r['restarts']} restart{'s' * (r['restarts'] > 1)}" if r["restarts"] else ""
+        print(f"{r['state']:9s} {r['name']}\n          {r['start']:%a %d %b %H:%M} -> {r['end']:%a %d %b %H:%M}"
+              f"  {src}{r['url']}\n          {disk}{extra}"
+              + (f"  last data {ago(r['last'])}" if r["last"] else ""))
+    if pages and a.pages:
+        print("pages:")
+        for n, u in pages.items():
+            print(f"  {n}: {u}")
+    if not rows:
+        print("no streams scheduled")
+
+
+def kv_opts(items):
+    opts = {}
+    for it in items or []:
+        k, sep, v = it.partition("=")
+        if not sep:
+            raise SystemExit(f"--set wants key=value, got {it!r}")
+        v = v.strip()
+        opts[k.strip().replace("-", "_")] = (True if v == "true" else False if v == "false"
+                                             else int(v) if re.fullmatch(r"-?\d+", v) else v)
+    return opts
+
+
+def cmd_add(a):
+    _, pages, _ = read_schedule(a.file)
+    target = a.target
+    url, page = (None, target) if target in pages else (target, None)
+    if url and not re.match(r"https?://", url):
+        sys.exit(f"{target!r} is not a URL or a saved page (pages: {', '.join(pages) or 'none'})")
+    opts = kv_opts(a.set)
+    if a.mode:
+        opts["mode"] = a.mode
+    if a.part:
+        opts["part"] = a.part
+    try:
+        name = add_stream(a.file, a.start, url=url, page=page, end=a.end, duration=a.duration,
+                          name=a.name, opts=opts)
+    except (ValueError, argparse.ArgumentTypeError) as e:
+        sys.exit(f"not added: {e}")
+    print(f"added {name}")
+
+
+def cmd_remove(a):
+    try:
+        remove_stream(a.file, a.name)
+    except ValueError as e:
+        sys.exit(str(e))
+    print(f"removed {a.name} (its recordings stay on disk; a running recording stops within 15 s)")
+
+
+def cmd_page(a):
+    try:
+        if a.action == "add":
+            add_page(a.file, a.name, a.url)
+        elif a.action == "remove":
+            remove_page(a.file, a.name)
+        else:
+            for n, u in read_schedule(a.file)[1].items():
+                print(f"{n}: {u}")
+            return
+    except ValueError as e:
+        sys.exit(str(e))
+    print("ok")
+
+
+# ----------------------------------------------------------------------------- web page
+# Small phone page for the schedule. Reach it over Tailscale only: it binds to the tailscale
+# address by default and refuses clients from public IPs, so a port forward can't expose it.
+ALLOWED_NETS = [ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48",  # loopback, tailscale
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fe80::/10", "fc00::/7")]  # LAN
+
+CSS = """
+:root{--bg:#f6f6f4;--card:#fff;--fg:#1c1c1a;--mute:#6b6b66;--line:#e2e2dd;--acc:#c2410c;
+--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--onacc:#fff;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#121211;--card:#1d1d1b;--fg:#ececea;--mute:#9a9a94;
+--line:#2f2f2c;--acc:#fb923c;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--onacc:#1c1c1a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:16px/1.4 system-ui,-apple-system,sans-serif;padding:env(safe-area-inset-top) 0 40px}
+main{max-width:640px;margin:0 auto;padding:12px 16px}
+h1{font-size:20px;margin:8px 0 12px;display:flex;justify-content:space-between;align-items:baseline}
+h1 small{font-size:13px;font-weight:400;color:var(--mute)}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin:22px 0 8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:8px 0}
+.row{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}
+.name{font-weight:600;word-break:break-all}.mute{color:var(--mute);font-size:14px}
+.url{font-size:13px;color:var(--mute);word-break:break-all}
+.pill{font-size:12px;font-weight:600;padding:2px 8px;border-radius:99px;border:1px solid currentColor;white-space:nowrap}
+.recording{color:var(--ok)}.starting,.due,.retrying,.no{color:var(--warn)}.missed{color:var(--bad)}
+.upcoming,.done{color:var(--mute)}
+.err{background:var(--bad);color:#fff;border-radius:10px;padding:10px 14px;margin:8px 0}
+.okmsg{background:var(--ok);color:var(--onacc);border-radius:10px;padding:10px 14px;margin:8px 0}
+form.inline{margin:0}button{font:inherit;border-radius:10px;border:1px solid var(--line);
+background:var(--card);color:var(--fg);padding:8px 12px}
+button.del{color:var(--bad);font-size:14px;padding:4px 10px}button.go{background:var(--acc);
+border-color:var(--acc);color:var(--onacc);font-weight:600;width:100%;padding:12px}
+label{display:block;font-size:13px;color:var(--mute);margin:10px 0 4px}
+input,select{font:inherit;width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);
+background:var(--bg);color:var(--fg);min-width:0}
+.two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
+@media (max-width:480px){.two.when{grid-template-columns:minmax(0,1fr)}}
+details summary{cursor:pointer;color:var(--mute);font-size:14px;margin-top:10px}
+a{color:var(--acc)}
+"""
+
+ICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100"
+rx="22" fill="#c2410c"/><circle cx="50" cy="50" r="22" fill="#fff"/></svg>"""
+
+JS = """
+const box=document.getElementById('jobs');
+setInterval(()=>fetch('jobs').then(r=>r.ok&&r.text()).then(t=>{if(t)box.innerHTML=t}).catch(()=>{}),20000);
+document.addEventListener('submit',e=>{const m=e.target.dataset.confirm;if(m&&!confirm(m))e.preventDefault()});
+const s=document.getElementById('start'),en=document.getElementById('end');
+s&&s.addEventListener('change',()=>{if(!s.value)return;const d=new Date(s.value);d.setHours(d.getHours()+2);
+const p=n=>String(n).padStart(2,'0');en.value=`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`});
+"""
+
+
+def e(s):
+    return html.escape(str(s), quote=True)
+
+
+def local_input(t):
+    return t.strftime("%Y-%m-%dT%H:%M")
+
+
+def fmt_span(a, b):
+    same = a.date() == b.date()
+    return f"{a:%a %d %b %H:%M} – {b:%H:%M}" if same else f"{a:%a %d %b %H:%M} – {b:%a %d %b %H:%M}"
+
+
+def jobs_html(path, rec_dir):
+    rows, pages, err, st, rec_dir = job_rows(path, rec_dir)
+    out = []
+    if err:
+        out.append(f'<div class="err">Schedule file has an error, the scheduler keeps the last good '
+                   f'version:<br>{e(err)}</div>')
+    if not st["alive"]:
+        out.append('<div class="err">The scheduler is not running, so nothing will record.</div>')
+    t = now()
+    groups = {"Live": [], "Upcoming": [], "Past": []}
+    for r in rows:
+        g = "Past" if r["end"] < t else "Live" if r["start"] - dt.timedelta(minutes=int(r["opts"].get("lead", 3))) <= t else "Upcoming"
+        groups[g].append(r)
+    groups["Past"].reverse()
+    for g, rs in groups.items():
+        if not rs:
+            continue
+        out.append(f"<h2>{g}</h2>")
+        for r in rs[:30]:
+            bits = []
+            if r["parts"]:
+                bits.append(f"{r['parts']} part{'s' * (r['parts'] != 1)} · {human_size(r['bytes'])}")
+            if r["last"] and g != "Past":
+                bits.append(f"last data {ago(r['last'])}")
+            if r["restarts"]:
+                bits.append(f"{r['restarts']} restart{'s' * (r['restarts'] > 1)}")
+            if r["runs"] > 1:
+                bits.append(f"{r['runs']} runs")
+            mode = r["opts"].get("mode")
+            if mode:
+                bits.append(e(mode))
+            src = f"<b>{e(r['page'])}</b> · " if r["page"] else ""
+            live = r["end"] >= t and r["state"] != "upcoming"
+            confirm = ("Stop this recording now and remove it? Parts already saved stay on disk."
+                       if live else "Remove this entry? Recordings on disk are kept.")
+            out.append(
+                f'<div class="card"><div class="row"><div><div class="name">{e(r["name"])}</div>'
+                f'<div class="mute">{fmt_span(r["start"], r["end"])}</div></div>'
+                f'<span class="pill {e(r["state"].split()[0])}">{e(r["state"])}</span></div>'
+                f'<div class="url">{src}{e(r["url"])}</div>'
+                f'<div class="row" style="margin-top:6px;align-items:center"><div class="mute">'
+                f'{" · ".join(bits)}{" · " if bits else ""}<a href="log/{quote(r["name"])}">log</a></div>'
+                f'<form class="inline" method="post" action="remove" data-confirm="{e(confirm)}">'
+                f'<input type="hidden" name="name" value="{e(r["name"])}">'
+                f'<button class="del">{"Stop" if live else "Remove"}</button></form></div></div>')
+    if not rows:
+        out.append('<p class="mute">Nothing scheduled yet.</p>')
+    return "".join(out)
+
+
+def page_html(path, rec_dir, msg=None, err=None):
+    _, pages, _ = read_schedule(path)
+    start = (now() + dt.timedelta(minutes=10)).replace(second=0, microsecond=0)
+    start += dt.timedelta(minutes=-start.minute % 5)
+    opts = "".join(f'<option value="{e(n)}">{e(n)}</option>' for n in pages)
+    page_list = "".join(
+        f'<div class="card row" style="align-items:center"><div><div class="name">{e(n)}</div>'
+        f'<div class="url">{e(u)}</div></div><form class="inline" method="post" action="page/remove" '
+        f'data-confirm="Delete saved page {e(n)}?"><input type="hidden" name="name" value="{e(n)}">'
+        f'<button class="del">Delete</button></form></div>' for n, u in pages.items())
+    banner = (f'<div class="err">{e(err)}</div>' if err else "") + (f'<div class="okmsg">{e(msg)}</div>' if msg else "")
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>streamrec</title><link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg"><link rel="apple-touch-icon" href="icon.svg">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#c2410c"><style>{CSS}</style></head><body><main>
+<h1>streamrec <small>{now():%a %d %b %H:%M}</small></h1>{banner}
+<div id="jobs">{jobs_html(path, rec_dir)}</div>
+<h2>Add a recording</h2>
+<form class="card" method="post" action="add">
+{f'<label>Saved page</label><select name="page"><option value="">— use the URL below —</option>{opts}</select>' if pages else ''}
+<label>URL</label><input name="url" type="url" inputmode="url" placeholder="https://…" autocomplete="off">
+<div class="two when"><div><label>Start</label><input id="start" name="start" type="datetime-local" required value="{local_input(start)}"></div>
+<div><label>End</label><input id="end" name="end" type="datetime-local" value="{local_input(start + dt.timedelta(hours=2))}"></div></div>
+<details><summary>More options</summary>
+<label>Name (folder)</label><input name="name" placeholder="automatic" autocomplete="off">
+<div class="two"><div><label>Mode</label><select name="mode"><option value="">default</option>
+<option>auto</option><option>grab</option><option>screen</option></select></div>
+<div><label>Duration (instead of end)</label><input name="duration" placeholder="e.g. 2h30m" autocomplete="off"></div></div>
+</details><div style="margin-top:14px"><button class="go">Schedule</button></div></form>
+<h2>Saved pages</h2>{page_list}
+<form class="card" method="post" action="page/add"><div class="two">
+<div><label>Name</label><input name="name" required placeholder="channel 1" autocomplete="off"></div>
+<div><label>URL</label><input name="url" type="url" required placeholder="https://…" autocomplete="off"></div></div>
+<div style="margin-top:12px"><button>Save page</button></div></form>
+<p class="mute">Removing an entry never deletes recordings. Files: {e(Path(rec_dir).expanduser())}</p>
+</main><script>{JS}</script></body></html>"""
+
+
+def tail(p, n=200):
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 64_000))
+            return b"\n".join(f.read().splitlines()[-n:]).decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def make_handler(path, rec_dir):
+    from http.server import BaseHTTPRequestHandler
+
+    class H(BaseHTTPRequestHandler):
+        server_version = "streamrec"
+
+        def log_message(self, fmt, *args):
+            log.debug("web %s " + fmt, self.client_address[0], *args)
+
+        def allowed(self):
+            ip = ipaddress.ip_address(self.client_address[0].split("%")[0])
+            if getattr(ip, "ipv4_mapped", None):
+                ip = ip.ipv4_mapped
+            if any(ip in n for n in ALLOWED_NETS if n.version == ip.version):
+                return True
+            log.warning("web: refused client %s (not tailscale/LAN)", ip)
+            self.send(403, "forbidden\n", "text/plain")
+            return False
+
+        def send(self, code, body, ctype="text/html; charset=utf-8", extra=()):
+            b = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            for k, v in extra:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(b)
+
+        def redirect(self, msg=None, err=None):
+            q = "?" + "&".join(f"{k}={quote(v)}" for k, v in (("msg", msg), ("err", err)) if v) if msg or err else ""
+            self.send(303, "", extra=[("Location", "./" + q)])
+
+        def do_GET(self):
+            if not self.allowed():
+                return
+            u = urlparse(self.path)
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            p = u.path.rstrip("/") or "/"
+            if p == "/":
+                self.send(200, page_html(path, rec_dir, q.get("msg"), q.get("err")))
+            elif p == "/jobs":
+                self.send(200, jobs_html(path, rec_dir))
+            elif p == "/manifest.webmanifest":
+                self.send(200, json.dumps({"name": "streamrec", "short_name": "streamrec", "start_url": "./",
+                                           "display": "standalone", "background_color": "#121211",
+                                           "theme_color": "#c2410c", "icons": [{"src": "icon.svg", "sizes": "any",
+                                                                                "type": "image/svg+xml"}]}),
+                          "application/manifest+json")
+            elif p == "/icon.svg":
+                self.send(200, ICON, "image/svg+xml")
+            elif p.startswith("/log/"):
+                from urllib.parse import unquote
+                name = unquote(p[5:])
+                st = read_status() or {}
+                d = Path(st.get("dir") or rec_dir).expanduser()
+                if name != safe_name(name) or not (d / name).is_dir():
+                    return self.send(404, "no such recording\n", "text/plain; charset=utf-8")
+                body = "\n\n".join(f"== {f} ==\n{tail(d / name / f)}" for f in
+                                   ("recorder.log", "console.log", "ffmpeg.log") if (d / name / f).exists())
+                self.send(200, body or "(no logs yet)\n", "text/plain; charset=utf-8")
+            else:
+                self.send(404, "not found\n", "text/plain")
+
+        def do_POST(self):
+            if not self.allowed():
+                return
+            origin = self.headers.get("Origin")  # basic CSRF guard: forms must come from this page
+            if origin and origin != "null" and urlparse(origin).netloc != self.headers.get("Host"):
+                return self.send(403, "bad origin\n", "text/plain")
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 20_000:
+                return self.send(413, "too big\n", "text/plain")
+            f = {k: v[0].strip() for k, v in parse_qs(self.rfile.read(n).decode()).items()}
+            p = urlparse(self.path).path
+            try:
+                if p.endswith("/add") and not p.endswith("page/add"):
+                    opts = {"mode": f["mode"]} if f.get("mode") in ("auto", "grab", "screen") else {}
+                    name = add_stream(path, f.get("start", ""), url=f.get("url") if not f.get("page") else None,
+                                      page=f.get("page") or None,
+                                      end=None if f.get("duration") else f.get("end"),
+                                      duration=f.get("duration") or None, name=f.get("name") or None, opts=opts)
+                    return self.redirect(msg=f"Scheduled {name}")
+                if p.endswith("page/add"):
+                    add_page(path, f.get("name", ""), f.get("url", ""))
+                    return self.redirect(msg=f"Saved page {f.get('name')}")
+                if p.endswith("page/remove"):
+                    remove_page(path, f.get("name", ""))
+                    return self.redirect(msg=f"Deleted page {f.get('name')}")
+                if p.endswith("/remove"):
+                    remove_stream(path, f.get("name", ""))
+                    return self.redirect(msg=f"Removed {f.get('name')}")
+            except (ValueError, argparse.ArgumentTypeError) as ex:
+                return self.redirect(err=str(ex))
+            self.send(404, "not found\n", "text/plain")
+
+    return H
+
+
+def tailscale_ip():
+    try:
+        r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=10)
+        return r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def parse_bind(bind):
+    """'auto' (tailscale address), 'ADDR', 'ADDR:PORT' or '[v6]:PORT'; default port 8787."""
+    bind = bind or "auto"
+    host, port = bind, 8787
+    if bind.startswith("[") or bind.count(":") == 1:
+        host, _, p = bind.rpartition(":")
+        port = int(p) if p.isdigit() else 8787
+    host = host.strip("[]") or "auto"
+    if host == "auto":
+        host = tailscale_ip()
+        if not host:
+            raise SystemExit("couldn't get the tailscale address (is tailscale up?); "
+                             "pass --bind ADDR:PORT, e.g. your LAN address or 127.0.0.1")
+    if host in ("0.0.0.0", "::"):
+        log.warning("web: listening on all interfaces; clients from public IPs are still refused")
+    return host, port
+
+
+def serve_web(bind, path, rec_dir, retry=True):
+    """Serve until the process exits. Keeps retrying the bind (tailscale may come up after us)."""
+    import socket
+    from http.server import ThreadingHTTPServer
+
+    warned = False
+    while not STOP.is_set():
+        try:
+            host, port = parse_bind(bind)
+            cls = type("Server", (ThreadingHTTPServer,), {
+                "address_family": socket.AF_INET6 if ":" in host else socket.AF_INET, "daemon_threads": True})
+            srv = cls((host, port), make_handler(Path(path).expanduser(), rec_dir))
+        except (OSError, SystemExit, ValueError) as ex:
+            if not retry:
+                raise SystemExit(f"web: {ex}")
+            if not warned:
+                log.error("web: can't start (%s); retrying every 30 s", ex)
+                warned = True
+            STOP.wait(30)
+            continue
+        log.info("web page on http://%s/", f"[{host}]:{port}" if ":" in host else f"{host}:{port}")
+        threading.Thread(target=lambda: (STOP.wait(), srv.shutdown()), daemon=True).start()
+        srv.serve_forever()
+        return
+
+
+def cmd_web(a):
+    serve_web(a.bind, a.file, Path(a.dir).expanduser(), retry=False)
+
+
+class ArgError(Exception):
+    pass
+
+
+class Parser(argparse.ArgumentParser):
+    raise_errors = False
+
+    def error(self, message):
+        if self.raise_errors:
+            raise ArgError(message)
+        super().error(message)
+
+
+def build_parser():
+    fmt = argparse.ArgumentDefaultsHelpFormatter
+    p = Parser(description="Record a live stream from a web page.", formatter_class=fmt)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def browser_opts(sp):
@@ -706,7 +1443,11 @@ def main():
         sp.add_argument("--show", action="store_true", help="show the browser window (grab/probe)")
         sp.add_argument("--find-timeout", type=int, default=90, help="seconds to get the video going")
 
-    r = sub.add_parser("record", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    def sched_file(sp):
+        sp.add_argument("--file", default=DEFAULT_SCHEDULE, help="schedule file")
+        sp.add_argument("--dir", default=DEFAULT_DIR, help="recordings folder")
+
+    r = sub.add_parser("record", formatter_class=fmt)
     browser_opts(r)
     r.add_argument("--start", default="now", help="'now', 'HH:MM' or ISO datetime")
     g = r.add_mutually_exclusive_group(required=True)
@@ -727,6 +1468,7 @@ def main():
     r.add_argument("--crf", type=int, default=23, help="screen: libx264 quality (lower = better)")
     r.add_argument("--display", type=int, default=99, help="screen: Xvfb display number")
     r.set_defaults(fn=cmd_record)
+    p.record = r
 
     pr = sub.add_parser("probe", help="test a page: find playlists / check playback")
     browser_opts(pr)
@@ -742,15 +1484,61 @@ def main():
     j.set_defaults(fn=cmd_join)
 
     sc = sub.add_parser("schedule", help="run all recordings from a TOML schedule file")
-    sc.add_argument("file", nargs="?", default="~/.config/streamrec/schedule.toml")
-    sc.add_argument("--dir", default="~/recordings", help="where each recording's folder goes")
+    sc.add_argument("file", nargs="?", default=DEFAULT_SCHEDULE)
+    sc.add_argument("--dir", default=DEFAULT_DIR, help="where each recording's folder goes")
     sc.add_argument("--check", action="store_true", help="validate the file and list the streams")
+    sc.add_argument("--web", nargs="?", const="auto", metavar="ADDR[:PORT]",
+                    help="also serve the web page ('auto' = this machine's tailscale address, port 8787)")
     sc.set_defaults(fn=cmd_schedule)
 
+    ls = sub.add_parser("list", help="show scheduled streams and their status", formatter_class=fmt)
+    sched_file(ls)
+    ls.add_argument("--days", type=int, default=7, help="show finished streams from the last N days")
+    ls.add_argument("--all", action="store_true", help="show every finished stream")
+    ls.add_argument("--pages", action="store_true", help="also list saved pages")
+    ls.set_defaults(fn=cmd_list)
+
+    ad = sub.add_parser("add", help="add a stream to the schedule", formatter_class=fmt,
+                        description="Add a [[stream]] entry. Comments and layout of the file are kept.")
+    ad.add_argument("target", help="page URL, or the name of a saved page")
+    ad.add_argument("--start", required=True, help="'now', 'HH:MM' (next occurrence) or 'YYYY-MM-DDTHH:MM'")
+    g = ad.add_mutually_exclusive_group(required=True)
+    g.add_argument("--end", help="'HH:MM' (after start) or 'YYYY-MM-DDTHH:MM'")
+    g.add_argument("--duration", help="e.g. 2h, 2h30m")
+    ad.add_argument("--name", help="folder name (default: <date>-<site or page>)")
+    ad.add_argument("--mode", choices=["auto", "grab", "screen"])
+    ad.add_argument("--part", help="part length, e.g. 5m")
+    ad.add_argument("--set", action="append", metavar="KEY=VALUE", help="any other record option, e.g. lead=10")
+    sched_file(ad)
+    ad.set_defaults(fn=cmd_add)
+
+    rm = sub.add_parser("remove", help="remove a stream from the schedule (files are kept)", formatter_class=fmt)
+    rm.add_argument("name")
+    sched_file(rm)
+    rm.set_defaults(fn=cmd_remove)
+
+    pg = sub.add_parser("page", help="saved stream pages: list | add NAME URL | remove NAME", formatter_class=fmt)
+    pg.add_argument("action", choices=["list", "add", "remove"], nargs="?", default="list")
+    pg.add_argument("name", nargs="?")
+    pg.add_argument("url", nargs="?")
+    sched_file(pg)
+    pg.set_defaults(fn=cmd_page)
+
+    w = sub.add_parser("web", help="serve the phone page (also: schedule --web)", formatter_class=fmt)
+    w.add_argument("--bind", default="auto", help="ADDR[:PORT]; 'auto' = tailscale address, port 8787")
+    sched_file(w)
+    w.set_defaults(fn=cmd_web)
+    return p
+
+
+def main():
+    p = build_parser()
     a = p.parse_args()
+    if a.cmd == "page" and ((a.action == "add" and not (a.name and a.url)) or (a.action == "remove" and not a.name)):
+        p.exit(2, "usage: page add NAME URL | page remove NAME\n")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     for s in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(s, lambda *_: (log.info("stopping..."), STOP.set()))
+        signal.signal(s, lambda *_: (log.info("stopping..."), STOP.set(), KICK.set()))
     a.fn(a)
 
 
