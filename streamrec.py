@@ -63,6 +63,12 @@ JS_VIDEOS = """() => Array.from(document.querySelectorAll('video')).map(v => {
   return {area: r.width * r.height, t: v.currentTime, paused: v.paused, ready: v.readyState};
 })"""
 
+JS_QUALITY = """() => Array.from(document.querySelectorAll('video')).map(v => {
+  const r = v.getBoundingClientRect(), q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
+  return {area: r.width * r.height, w: v.videoWidth, h: v.videoHeight,
+          total: q.totalVideoFrames || 0, dropped: q.droppedVideoFrames || 0};
+})"""
+
 JS_FILL = """(el) => {
   const s = el.style, imp = 'important';
   s.setProperty('position', 'fixed', imp); s.setProperty('inset', '0', imp);
@@ -297,6 +303,18 @@ class Browser:
             last = snap
         return bool(self.found)
 
+    def quality(self):
+        """Frame counters of the biggest playing video: {'w','h','total','dropped'} or None."""
+        best = None
+        for fr in self.page.frames:
+            try:
+                for v in fr.evaluate(JS_QUALITY):
+                    if v["area"] > 0 and (best is None or v["area"] > best["area"]):
+                        best = v
+            except Exception:
+                pass
+        return best
+
     def theater(self):
         """Make the video fill the window (fullscreen if allowed, CSS otherwise)."""
         fr, el = self._largest_video()
@@ -413,13 +431,62 @@ def screen_cmd(a, display, pattern):
             "-framerate", str(a.fps), "-video_size", a.size, "-i", display,
             "-thread_queue_size", "1024", "-f", "pulse", "-i", f"{a.sink}.monitor",
             *v, "-pix_fmt", "yuv420p", "-g", str(a.fps * 2), "-c:a", "aac", "-b:a", "160k",
+            "-stats_period", "10", "-progress", str(Path(pattern).parent / "ffmpeg.progress"),
             "-f", "segment", "-segment_time", str(a.part),
             "-reset_timestamps", "1", "-segment_format", "mpegts", pattern]
+
+
+class Health:
+    """Once a minute, log whether the machine keeps up in screen mode (and say what to change)."""
+
+    def __init__(self, out):
+        self.out, self.next, self.q0, self.frozen, self.samples, self.warned = out, time.time() + 60, None, 0, 0, False
+
+    def sample(self, b, moved):
+        self.samples += 1
+        self.frozen += not moved
+        if time.time() < self.next:
+            return
+        self.next = time.time() + 60
+        bits, bad = [], []
+        q = b.quality()
+        if q and self.q0 and q["total"] >= self.q0["total"]:
+            tot, drop = q["total"] - self.q0["total"], q["dropped"] - self.q0["dropped"]
+            pct = 100 * drop / tot if tot else 0
+            bits.append(f"browser showed {tot} frames, dropped {pct:.0f}% ({q['w']}x{q['h']} video)")
+            if pct > 5:
+                bad.append("the browser drops frames")
+        self.q0 = q
+        if self.frozen:
+            bits.append(f"video not advancing in {self.frozen}/{self.samples} checks")
+        self.frozen = self.samples = 0
+        prog = {}
+        try:  # last block of ffmpeg -progress output
+            for ln in (self.out / "ffmpeg.progress").read_text().splitlines()[-20:]:
+                k, _, v = ln.partition("=")
+                prog[k] = v
+        except OSError:
+            pass
+        sp = prog.get("speed", "").rstrip("x").strip()
+        if re.fullmatch(r"[\d.]+", sp):
+            bits.append(f"encoder speed {float(sp):.2f}x")
+            if float(sp) < 0.97:
+                bad.append("the encoder can't keep up")
+        load = os.getloadavg()[0]
+        bits.append(f"load {load:.1f} on {os.cpu_count()} cores")
+        if load > os.cpu_count():
+            bad.append("the CPU is overloaded")
+        log.info("health: %s", ", ".join(bits))
+        if bad:
+            log.warning("recording may stutter: %s. To lighten it: --size 1280x720, --fps 25, or "
+                        "--vcodec h264_vaapi (hardware encoding)%s", " and ".join(bad),
+                        "; and/or --extension with an ad blocker" if "the browser drops frames" in bad else "")
 
 
 def screen_session(a, out, end):
     d = Display(a)
     b = ff = None
+    health = Health(out)
     try:
         while not STOP.is_set() and now() < end:
             if b is None:
@@ -446,9 +513,11 @@ def screen_session(a, out, end):
                 b.close()
                 b = None
                 continue
-            if snap != last and any(not p for _, p in snap):
+            moved = snap != last and any(not p for _, p in snap)
+            if moved:
                 last_change = time.time()
             last = snap
+            health.sample(b, moved)
             b.theater()  # players sometimes reset styles
             if time.time() - last_change > a.stall:
                 log.warning("video frozen for %ss - reloading page", a.stall)

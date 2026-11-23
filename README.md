@@ -58,6 +58,10 @@ python3 streamrec.py record URL --start 21:00 --end 01:30 --rclone gdrive:stream
 - **Logins and cookie banners:** run `python3 streamrec.py login URL` once. The recorder reuses that browser profile.
 - **Ad blocker (recommended for ad-heavy sites):** download uBlock Origin Lite, unzip it, and add
   `--extension /path/to/uBOLite`.
+- **Choppy screen recordings:** in screen mode, `recorder.log` has a `health:` line every minute: frames the
+  browser dropped, how often the video stopped advancing, encoder speed and CPU load. When the machine can't keep up,
+  a warning says so and what to change: `--size 1280x720`, `--fps 25`, `--vcodec h264_vaapi`, or an ad blocker.
+  Check with `grep -E "health|stutter" recorder.log`.
 - **On an Intel mini PC:** `--vcodec h264_vaapi` makes screen mode use the hardware video encoder and frees up the CPU.
   You may also need ffmpeg's `-vaapi_device` option. Stick with libx264 until that's set up.
 
